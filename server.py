@@ -1,6 +1,7 @@
 import os
 import sys
 import logging
+import shutil
 
 # Ensure all logging is routed strictly to stderr at CRITICAL level BEFORE importing fastmcp
 logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
@@ -20,6 +21,8 @@ from collections import Counter
 from fastmcp import FastMCP
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
+from modernizer import LegacySmellDetector, CodeModernizer
+
 # ---------------------------------------------------------------------------
 # Server Initialization
 # ---------------------------------------------------------------------------
@@ -38,7 +41,6 @@ _TECH_STOP_WORDS = {
     "its", "their", "if", "else", "then", "all", "each", "any"
 }
 
-# Domain keyword expansions for high-precision semantic matching
 QUERY_EXPANSIONS = {
     "async": ["asyncio", "httpx", "aiofiles", "taskgroup", "cancellederror", "concurrency"],
     "blocking": ["asyncio", "httpx", "time.sleep", "thread", "io"],
@@ -116,7 +118,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# Core Tools (Phase 1 & Phase 2+)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
@@ -142,7 +144,7 @@ def read_legacy_file(file_path: str) -> str:
         if file_size > MAX_READ_FILE_SIZE_BYTES:
             return (
                 f"Error: File '{file_path}' is {file_size / (1024*1024):.2f}MB, "
-                f"exceeding the maximum allowed size limit of {MAX_READ_FILE_SIZE_BYTES / (1024*1024):.0f}MB."
+                f"exceeding maximum allowed size limit of {MAX_READ_FILE_SIZE_BYTES / (1024*1024):.0f}MB."
             )
 
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
@@ -155,7 +157,7 @@ def read_legacy_file(file_path: str) -> str:
 @mcp.tool()
 def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> str:
     """
-    Query the RAG vector database for modernization and clean-code guidelines with hybrid search.
+    Query the RAG vector database for modernization and clean-code guidelines.
 
     Args:
         query:     Natural language query or code snippet to match against guidelines.
@@ -166,10 +168,7 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
     try:
         n_results = max(1, min(n_results, 10))
         chroma_dir = os.path.join(WORKSPACE_ROOT, ".chroma_db")
-        
-        # Expand query for domain synonyms
-        expanded_q = expand_query(query)
-        
+
         if os.path.exists(chroma_dir):
             try:
                 import chromadb
@@ -179,9 +178,8 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
 
                 where_filter = {"category": {"$eq": category.strip()}} if category.strip() else None
 
-                # Query with expanded search terms
                 results = collection.query(
-                    query_texts=[expanded_q],
+                    query_texts=[query],
                     n_results=n_results,
                     where=where_filter,
                     include=["documents", "metadatas", "distances"]
@@ -371,7 +369,6 @@ def run_local_tests(command: str) -> str:
         if not command_clean:
             return "Error: Empty command specified."
 
-        # Prevent shell command chaining injection
         dangerous_chars = [";", "&&", "||", "`", "$("]
         for char in dangerous_chars:
             if char in command_clean:
@@ -457,6 +454,187 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
         return f"{status_msg}\n{commit_info}\nDraft PR metadata written to '{pr_file_path}'."
     except Exception as e:
         return f"Error performing Git modernization operations: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Autonomous Refactoring Loop Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def analyze_legacy_codebase(file_path: str) -> str:
+    """
+    Phase 3 Tool: Audits legacy code for enterprise code smells and cross-references
+    matching guidelines from the RAG database to generate a Modernization Strategy.
+
+    Args:
+        file_path: Target relative or absolute file path to analyze.
+    """
+    try:
+        code = read_legacy_file(file_path)
+        if code.startswith("Error:"):
+            return code
+
+        findings = LegacySmellDetector.scan_code(code, file_path)
+
+        if not findings:
+            return f"## Modernization Audit Report for `{file_path}`\n\n✅ No legacy code smells detected. File satisfies active enterprise standards."
+
+        report = [f"## Modernization Audit Report for `{file_path}`\n"]
+        report.append(f"Found **{len(findings)}** code smell(s):\n")
+
+        for f in findings:
+            smell_id = f["smell_id"]
+            name = f["name"]
+            line = f["line_number"]
+            severity = f["severity"]
+            query = f["rag_query"]
+
+            report.append(f"### [{severity}] `{smell_id}`: {name} (Line {line})")
+            report.append(f"```code\n{f['line_content']}\n```")
+
+            # Fetch matching guideline from RAG
+            rag_res = query_rag_guidelines(query, category=f["category"], n_results=1)
+            report.append(f"**Recommended Guideline**:\n{rag_res}\n\n---\n")
+
+        return "\n".join(report)
+    except Exception as e:
+        return f"Error analyzing legacy codebase for '{file_path}': {str(e)}"
+
+
+@mcp.tool()
+def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
+    """
+    Phase 3 Tool: Applies modernization changes to a file safely. Creates a backup snapshot (.bak)
+    before writing edits. If modernized_code is omitted, auto-applies rule-based refactorings.
+
+    Args:
+        file_path:        Target file path within workspace.
+        modernized_code:  Optional custom refactored code string. If empty, uses automated rules.
+    """
+    try:
+        full_path = (
+            os.path.abspath(os.path.join(WORKSPACE_ROOT, file_path))
+            if not os.path.isabs(file_path)
+            else os.path.abspath(file_path)
+        )
+
+        if not is_path_in_workspace(full_path):
+            return f"Error: Path '{file_path}' is outside authorized project workspace."
+
+        if not os.path.exists(full_path):
+            return f"Error: File '{file_path}' does not exist."
+
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            original_code = f.read()
+
+        # Create backup snapshot
+        backup_path = full_path + ".bak"
+        shutil.copyfile(full_path, backup_path)
+
+        if modernized_code.strip():
+            new_code = modernized_code
+            applied_changes = ["Applied user-supplied modernized code."]
+        else:
+            if full_path.endswith(".py"):
+                new_code, applied_changes = CodeModernizer.modernize_python(original_code)
+            elif full_path.endswith((".ts", ".js")):
+                new_code, applied_changes = CodeModernizer.modernize_typescript(original_code)
+            else:
+                return f"Error: Automated modernization rules not implemented for file extension of '{file_path}'."
+
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+
+        changes_summary = "\n".join(f"  - {c}" for c in applied_changes)
+        return (
+            f"Successfully updated '{file_path}'.\n"
+            f"Backup created at '{file_path}.bak'.\n"
+            f"Applied Transformations:\n{changes_summary}"
+        )
+    except Exception as e:
+        return f"Error applying modernization to '{file_path}': {str(e)}"
+
+
+@mcp.tool()
+def run_autonomous_modernization_pipeline(
+    file_path: str,
+    test_command: str = "python -m unittest test_server.py",
+    branch_name: str = "auto-modernization-branch"
+) -> str:
+    """
+    Phase 3 Tool: Executes the complete autonomous refactoring loop:
+      1. Scans file for legacy smells & queries RAG guidelines.
+      2. Applies parity-preserving modernizations (with .bak safety snapshot).
+      3. Executes verification test suite.
+      4. If tests PASS -> Stages, commits, and creates draft PR.
+      5. If tests FAIL -> Automatically rolls back file from backup snapshot!
+
+    Args:
+        file_path:    Target legacy file to modernize.
+        test_command: Sandboxed test command to verify behavior (default 'python -m unittest test_server.py').
+        branch_name:  Target Git branch for PR creation (default 'auto-modernization-branch').
+    """
+    full_path = (
+        os.path.abspath(os.path.join(WORKSPACE_ROOT, file_path))
+        if not os.path.isabs(file_path)
+        else os.path.abspath(file_path)
+    )
+    backup_path = full_path + ".bak"
+
+    try:
+        # Step 1: Audit
+        audit_res = analyze_legacy_codebase(file_path)
+
+        # Step 2: Apply modernization
+        mod_res = apply_code_modernization(file_path)
+        if mod_res.startswith("Error"):
+            return f"Pipeline Aborted during modernization phase:\n{mod_res}"
+
+        # Step 3: Run Verification Tests
+        test_res = run_local_tests(test_command)
+
+        if "Exit Code: 0" in test_res or "OK" in test_res:
+            # Step 4: Verification Passed -> Git PR
+            pr_res = create_git_migration_pr(
+                branch_name=branch_name,
+                commit_message=f"refactor: autonomous modernization of {os.path.basename(file_path)}",
+                pr_title=f"Autonomous Modernization: {os.path.basename(file_path)}",
+                pr_description=f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{mod_res}\n\n### Test Verification\nPassed: `{test_command}`"
+            )
+
+            # Cleanup backup on success
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+
+            return (
+                f"🎉 Autonomous Modernization Pipeline Completed Successfully!\n\n"
+                f"1. Audit Findings & RAG Match:\n{audit_res[:300]}...\n\n"
+                f"2. Transformations Applied:\n{mod_res}\n\n"
+                f"3. Verification Results:\n{test_res}\n\n"
+                f"4. Git Status:\n{pr_res}"
+            )
+        else:
+            # Step 5: Verification Failed -> Automatic Rollback!
+            if os.path.exists(backup_path):
+                shutil.copyfile(backup_path, full_path)
+                os.remove(backup_path)
+                rollback_status = f"Rolled back '{file_path}' from backup snapshot."
+            else:
+                rollback_status = "Backup snapshot file not found for rollback."
+
+            return (
+                f"❌ Autonomous Modernization Pipeline Failed Verification Tests!\n"
+                f"{rollback_status}\n\n"
+                f"Test Output:\n{test_res}"
+            )
+    except Exception as e:
+        if os.path.exists(backup_path):
+            try:
+                shutil.copyfile(backup_path, full_path)
+                os.remove(backup_path)
+            except Exception:
+                pass
+        return f"Error executing autonomous modernization pipeline for '{file_path}': {str(e)}"
 
 
 if __name__ == "__main__":
