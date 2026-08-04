@@ -22,18 +22,24 @@
 - [x] Harden file reading with max 5MB size limit (`read_legacy_file`).
 - [x] Harden sandbox command execution with shell injection prevention (`run_local_tests`).
 
-## Phase 3: Autonomous Modernization Loop (COMPLETED)
+## Phase 3: Autonomous Modernization Loop & Local Model Integration (COMPLETED)
 - [x] Implement static code smell detection engine (`modernizer.py` / `LegacySmellDetector`).
 - [x] Implement rule-based parity-preserving code transformation engine (`CodeModernizer`).
+- [x] Integrate fine-tuned local Unsloth LLM model adapter (`local_llm.py`):
+  - Model Path: `C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774`
+  - Base Model: `unsloth/Qwen3.5-2B`
+  - Chat template prompt formatter (`apply_chat_template`)
+- [x] Expose `get_local_llm_status` MCP tool for local fine-tuned LLM verification.
+- [x] Expose `generate_llm_modernization_proposal` MCP tool for RAG-guided local LLM refactoring proposals.
 - [x] Expose `analyze_legacy_codebase` MCP tool for code smell auditing & RAG guideline matching.
 - [x] Expose `apply_code_modernization` MCP tool with automated `.bak` safety backup snapshots.
 - [x] Expose `run_autonomous_modernization_pipeline` MCP tool combining:
   1. Legacy Audit & Smell Detection
   2. RAG Guideline Retrieval
-  3. Parity-Preserving Code Modernization
+  3. Parity-Preserving Code Modernization (Local LLM / Rule engine)
   4. Sandboxed Verification Test Execution
   5. Automatic Rollback on Failure / Git PR Draft Creation on Success!
-- [x] Expand unit test suite to **21/21 tests passing** in `test_server.py`.
+- [x] Expand unit test suite to **23/23 tests passing** in `test_server.py`.
 
 ## Phase 4: Git PR & Modernization Reporting (Next Phase)
 - Format comprehensive summary reports and manage PR creation workflows.
