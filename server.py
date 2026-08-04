@@ -1,4 +1,18 @@
 import os
+import sys
+import logging
+
+# Ensure all logging is routed strictly to stderr at CRITICAL level
+logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+stderr_handler = logging.StreamHandler(sys.stderr)
+stderr_handler.setLevel(logging.CRITICAL)
+logging.root.addHandler(stderr_handler)
+
+os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
+os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+
 import subprocess
 from fastmcp import FastMCP
 
@@ -165,5 +179,6 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
 
 
 if __name__ == "__main__":
-    print("Starting NovusPipeline FastMCP Server...")
-    mcp.run()
+    os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
+    os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+    mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
