@@ -8,15 +8,20 @@
   - `run_local_tests`
   - `create_git_migration_pr`
 - [x] Implement path traversal security boundaries (`is_path_in_workspace`).
-- [x] Implement `test_server.py` unit test suite (All 6 tests passing).
+- [x] Implement `test_server.py` unit test suite.
 - [x] Create `mcp_config_snippet.json` for Antigravity IDE MCP server registration.
 
-## Phase 2: RAG Vector Indexing (COMPLETED)
+## Phase 2 & 2+: Enterprise RAG Vector Pipeline & Server Robustness (COMPLETED)
 - [x] Configure persistent local ChromaDB vector database in `.chroma_db`.
-- [x] Implement `ingest_rag.py` with offline zero-dependency embedding function (`LocalSimpleEmbeddingFunction`).
-- [x] Populate `novus_guidelines` collection with enterprise refactoring handbooks (Python modernization, TypeScript standards, security rules, and clean code guidelines).
-- [x] Integrate vector search into `query_rag_guidelines` tool in `server.py`.
-- [x] Verify vector retrieval and unit tests in `test_server.py` (6/6 tests passing).
+- [x] Implement `ingest_rag.py` with offline zero-dependency TF-IDF weighted embedding (`TFIDFEmbeddingFunction`).
+- [x] Populate `novus_guidelines` collection with 14 enterprise refactoring handbooks across `python`, `typescript`, `security`, and `clean_code`.
+- [x] Implement category filtering (`python`, `typescript`, `security`, `clean_code`), `n_results` control, and relevance scoring.
+- [x] Implement `search_rag_by_id` tool for direct retrieval of guidelines by document ID (e.g. `py-001`).
+- [x] Implement `get_rag_stats` diagnostic tool for collection metrics and status reporting.
+- [x] Implement `reset_rag_database` management tool to trigger programmatically controlled DB re-seeding.
+- [x] Harden file reading with max 5MB size limit (`read_legacy_file`).
+- [x] Harden sandbox command execution with shell injection prevention (`run_local_tests`).
+- [x] Verify complete test suite in `test_server.py` (16/16 unit tests passing cleanly).
 
 ## Phase 3: Autonomous Modernization Loop (Next Phase)
 - Implement continuous refactoring pipeline with test-driven validation loops.
