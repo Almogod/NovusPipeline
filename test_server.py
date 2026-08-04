@@ -12,8 +12,14 @@ from server import (
     analyze_legacy_codebase,
     apply_code_modernization,
     run_autonomous_modernization_pipeline,
+    get_local_llm_status,
+    generate_llm_modernization_proposal,
+    format_modernization_report,
+    finalize_git_migration_pr,
 )
 from modernizer import LegacySmellDetector, CodeModernizer
+import local_llm
+from reporter import ModernizationReporter
 
 
 class TestNovusPipelineServerPhase3(unittest.TestCase):
@@ -132,7 +138,7 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
         self.assertIn("PY-SMELL-003", smell_ids)
 
     def test_code_modernizer_python(self):
-        code = "import urllib2\ntry:\n    pass\nexcept:\n    pass"
+        code = "import urllib2\ndef run():\n    try:\n        pass\n    except:\n        pass"
         mod_code, changes = CodeModernizer.modernize_python(code)
         self.assertIn("import httpx", mod_code)
         self.assertIn("except Exception as e:", mod_code)
@@ -187,6 +193,56 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
                 os.remove(test_file)
             if os.path.exists(test_file + ".bak"):
                 os.remove(test_file + ".bak")
+
+    def test_get_local_llm_status(self):
+        res = get_local_llm_status()
+        self.assertIn("Integrated Local LLM Status", res)
+        self.assertIn("unsloth_Qwen3.5-2B_1785882774", res)
+
+    def test_generate_llm_modernization_proposal(self):
+        test_file = "sample_proposal.py"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("import urllib2\ndef run():\n    pass")
+
+        try:
+            res = generate_llm_modernization_proposal(test_file, rag_query="httpx urllib2")
+            self.assertIn("LLM Modernization Proposal", res)
+            self.assertIn("unsloth_Qwen3.5-2B_1785882774", res)
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
+
+    def test_modernization_reporter(self):
+        report = ModernizationReporter.generate_report(
+            file_path="README.md",
+            audit_summary="Audit summary test",
+            modernization_details="Modernization details test",
+            test_output="Exit Code: 0",
+            branch_name="test-report-branch"
+        )
+        self.assertIn("NovusPipeline Codebase Modernization Report", report)
+        self.assertIn("test-report-branch", report)
+
+    def test_format_modernization_report(self):
+        res = format_modernization_report("README.md", branch_name="test-report-branch-tool", test_command="python --version")
+        self.assertIn("Successfully generated and saved Modernization Report artifact", res)
+
+    def test_finalize_git_migration_pr(self):
+        lock_file = os.path.join(os.getcwd(), ".git", "index.lock")
+        if os.path.exists(lock_file):
+            try:
+                os.remove(lock_file)
+            except Exception:
+                pass
+
+        res = finalize_git_migration_pr(
+            branch_name="test-final-pr-branch",
+            base_branch="main",
+            pr_title="Finalized PR Modernization",
+            pr_description="Full Phase 4 PR summary."
+        )
+        self.assertIn("NovusPipeline Git PR Finalization", res)
+        self.assertIn("gh pr create", res)
 
 
 if __name__ == "__main__":

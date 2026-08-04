@@ -22,6 +22,8 @@ from fastmcp import FastMCP
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
 from modernizer import LegacySmellDetector, CodeModernizer
+import local_llm
+from reporter import ModernizationReporter
 
 # ---------------------------------------------------------------------------
 # Server Initialization
@@ -135,7 +137,7 @@ def read_legacy_file(file_path: str) -> str:
         )
 
         if not is_path_in_workspace(full_path):
-            return f"Error: Path '{file_path}' is outside the authorized project workspace."
+            return f"Error: Path '{file_path}' is outside authorized project workspace."
 
         if not os.path.exists(full_path):
             return f"Error: File '{file_path}' does not exist."
@@ -457,8 +459,59 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Autonomous Refactoring Loop Tools
+# Phase 3 & Local LLM Integration Tools
 # ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_local_llm_status() -> str:
+    """
+    Returns the status and metadata for the integrated fine-tuned local model:
+    Path: C:\\Users\\Hp\\.unsloth\\studio\\outputs\\unsloth_Qwen3.5-2B_1785882774
+    """
+    try:
+        info = local_llm.get_model_info()
+        status_str = "Operational (Configured)" if info["exists"] else "Path Not Found"
+        return (
+            f"## Integrated Local LLM Status\n\n"
+            f"- **Model Path**: `{info['model_path']}`\n"
+            f"- **Model Name**: `{info['model_name']}`\n"
+            f"- **Base Model**: `{info['base_model']}`\n"
+            f"- **Adapter Config Found**: {info['has_adapter_config']}\n"
+            f"- **Status**: {status_str}"
+        )
+    except Exception as e:
+        return f"Error getting local LLM status: {str(e)}"
+
+
+@mcp.tool()
+def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> str:
+    """
+    Generates a modernized code proposal for a legacy file using the integrated fine-tuned
+    Unsloth Qwen 3.5 2B local model conditioned on retrieved RAG guidelines.
+
+    Args:
+        file_path: Relative or absolute path to legacy source file.
+        rag_query: Optional search query to customize RAG guideline retrieval.
+    """
+    try:
+        code = read_legacy_file(file_path)
+        if code.startswith("Error:"):
+            return code
+
+        search_term = rag_query.strip() if rag_query.strip() else f"Modernize legacy code {os.path.basename(file_path)}"
+        rag_guidelines = query_rag_guidelines(search_term, n_results=2)
+
+        proposal = local_llm.generate_llm_modernization(code, rag_guidelines)
+
+        return (
+            f"## LLM Modernization Proposal for `{file_path}`\n"
+            f"**Model**: `unsloth_Qwen3.5-2B_1785882774`\n\n"
+            f"### Retrieved Guidelines\n{rag_guidelines}\n\n"
+            f"### Proposed Refactoring\n{proposal}"
+        )
+    except Exception as e:
+        return f"Error generating LLM modernization proposal for '{file_path}': {str(e)}"
+
 
 @mcp.tool()
 def analyze_legacy_codebase(file_path: str) -> str:
@@ -492,7 +545,6 @@ def analyze_legacy_codebase(file_path: str) -> str:
             report.append(f"### [{severity}] `{smell_id}`: {name} (Line {line})")
             report.append(f"```code\n{f['line_content']}\n```")
 
-            # Fetch matching guideline from RAG
             rag_res = query_rag_guidelines(query, category=f["category"], n_results=1)
             report.append(f"**Recommended Guideline**:\n{rag_res}\n\n---\n")
 
@@ -527,13 +579,12 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
         with open(full_path, "r", encoding="utf-8", errors="replace") as f:
             original_code = f.read()
 
-        # Create backup snapshot
         backup_path = full_path + ".bak"
         shutil.copyfile(full_path, backup_path)
 
         if modernized_code.strip():
             new_code = modernized_code
-            applied_changes = ["Applied user-supplied modernized code."]
+            applied_changes = ["Applied LLM / user-supplied modernized code."]
         else:
             if full_path.endswith(".py"):
                 new_code, applied_changes = CodeModernizer.modernize_python(original_code)
@@ -602,7 +653,6 @@ def run_autonomous_modernization_pipeline(
                 pr_description=f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{mod_res}\n\n### Test Verification\nPassed: `{test_command}`"
             )
 
-            # Cleanup backup on success
             if os.path.exists(backup_path):
                 os.remove(backup_path)
 
@@ -614,7 +664,6 @@ def run_autonomous_modernization_pipeline(
                 f"4. Git Status:\n{pr_res}"
             )
         else:
-            # Step 5: Verification Failed -> Automatic Rollback!
             if os.path.exists(backup_path):
                 shutil.copyfile(backup_path, full_path)
                 os.remove(backup_path)
@@ -635,6 +684,99 @@ def run_autonomous_modernization_pipeline(
             except Exception:
                 pass
         return f"Error executing autonomous modernization pipeline for '{file_path}': {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Git PR & Modernization Reporting Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def format_modernization_report(
+    file_path: str,
+    branch_name: str = "auto-modernization-branch",
+    test_command: str = "python -m unittest test_server.py"
+) -> str:
+    """
+    Phase 4 Tool: Compiles audit findings, applied modernizations, test logs,
+    and Git PR metadata into an enterprise Markdown report saved under 'reports/'.
+
+    Args:
+        file_path:    Target modernized source file path.
+        branch_name:  Git branch associated with this migration.
+        test_command: Test command executed to verify the build.
+    """
+    try:
+        audit_res = analyze_legacy_codebase(file_path)
+        mod_details = f"Modernization applied to `{file_path}` using fine-tuned `unsloth_Qwen3.5-2B_1785882774` + rule engine."
+        test_res = run_local_tests(test_command)
+
+        report_md = ModernizationReporter.generate_report(
+            file_path=file_path,
+            audit_summary=audit_res,
+            modernization_details=mod_details,
+            test_output=test_res,
+            branch_name=branch_name
+        )
+
+        saved_file = ModernizationReporter.save_report_artifact(WORKSPACE_ROOT, branch_name, report_md)
+
+        return (
+            f"Successfully generated and saved Modernization Report artifact.\n"
+            f"Report Path: `{saved_file}`\n\n"
+            f"Report Summary Preview:\n{report_md[:400]}..."
+        )
+    except Exception as e:
+        return f"Error formatting modernization report for '{file_path}': {str(e)}"
+
+
+@mcp.tool()
+def finalize_git_migration_pr(
+    branch_name: str = "auto-modernization-branch",
+    base_branch: str = "main",
+    pr_title: str = "Refactor: Enterprise Codebase Modernization",
+    pr_description: str = "Automated modernization pipeline run complete."
+) -> str:
+    """
+    Phase 4 Tool: Finalizes Git PR metadata, verifies staged repository state,
+    creates draft PR markdown files, and formats full Pull Request workflow instructions.
+
+    Args:
+        branch_name:    Target feature/migration branch name.
+        base_branch:    Target base branch to merge into (default 'main').
+        pr_title:       Custom PR title.
+        pr_description: Custom PR summary description.
+    """
+    try:
+        import git
+        repo = git.Repo(WORKSPACE_ROOT)
+
+        git_res = create_git_migration_pr(
+            branch_name=branch_name,
+            commit_message=f"refactor: finalize enterprise modernization on {branch_name}",
+            pr_title=pr_title,
+            pr_description=pr_description
+        )
+
+        pr_file_path = os.path.join(WORKSPACE_ROOT, f".novus_pr_{branch_name}.md")
+        reports_dir = os.path.join(WORKSPACE_ROOT, "reports")
+        report_file = os.path.join(reports_dir, f"modernization_report_{branch_name}.md")
+
+        return (
+            f"## 🏁 NovusPipeline Git PR Finalization\n\n"
+            f"{git_res}\n\n"
+            f"### PR Artifact Checklist\n"
+            f"- **Base Branch**: `{base_branch}`\n"
+            f"- **Target Branch**: `{branch_name}`\n"
+            f"- **PR Summary Metadata**: `{pr_file_path}`\n"
+            f"- **Full Modernization Report**: `{report_file}`\n\n"
+            f"### GitHub / GitLab Command\n"
+            f"```shell\n"
+            f"git push origin {branch_name}\n"
+            f"gh pr create --title \"{pr_title}\" --body-file \"{pr_file_path}\" --base {base_branch}\n"
+            f"```"
+        )
+    except Exception as e:
+        return f"Error finalizing Git migration PR for branch '{branch_name}': {str(e)}"
 
 
 if __name__ == "__main__":
