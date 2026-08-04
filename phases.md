@@ -21,10 +21,19 @@
 - [x] Implement `reset_rag_database` management tool to trigger programmatically controlled DB re-seeding.
 - [x] Harden file reading with max 5MB size limit (`read_legacy_file`).
 - [x] Harden sandbox command execution with shell injection prevention (`run_local_tests`).
-- [x] Verify complete test suite in `test_server.py` (16/16 unit tests passing cleanly).
 
-## Phase 3: Autonomous Modernization Loop (Next Phase)
-- Implement continuous refactoring pipeline with test-driven validation loops.
+## Phase 3: Autonomous Modernization Loop (COMPLETED)
+- [x] Implement static code smell detection engine (`modernizer.py` / `LegacySmellDetector`).
+- [x] Implement rule-based parity-preserving code transformation engine (`CodeModernizer`).
+- [x] Expose `analyze_legacy_codebase` MCP tool for code smell auditing & RAG guideline matching.
+- [x] Expose `apply_code_modernization` MCP tool with automated `.bak` safety backup snapshots.
+- [x] Expose `run_autonomous_modernization_pipeline` MCP tool combining:
+  1. Legacy Audit & Smell Detection
+  2. RAG Guideline Retrieval
+  3. Parity-Preserving Code Modernization
+  4. Sandboxed Verification Test Execution
+  5. Automatic Rollback on Failure / Git PR Draft Creation on Success!
+- [x] Expand unit test suite to **21/21 tests passing** in `test_server.py`.
 
-## Phase 4: Git PR & Modernization Reporting
+## Phase 4: Git PR & Modernization Reporting (Next Phase)
 - Format comprehensive summary reports and manage PR creation workflows.
