@@ -30,7 +30,7 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
 
     def test_read_legacy_file_security_path_traversal(self):
         res = read_legacy_file("../../Windows/System32/drivers/etc/hosts")
-        self.assertIn("outside the authorized project workspace", res)
+        self.assertIn("outside authorized project workspace", res)
 
     def test_query_rag_guidelines_basic(self):
         res = query_rag_guidelines("refactor python 2 print statement")
