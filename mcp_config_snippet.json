@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "NovusPipeline": {
+      "command": "C:\\Users\\Hp\\Downloads\\NovusPipeline\\.venv\\Scripts\\python.exe",
+      "args": [
+        "C:\\Users\\Hp\\Downloads\\NovusPipeline\\server.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}
