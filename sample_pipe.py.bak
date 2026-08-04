@@ -1,5 +1,0 @@
-import urllib2
-try:
-    pass
-except:
-    pass
