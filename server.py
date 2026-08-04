@@ -29,6 +29,7 @@ mcp = FastMCP("NovusPipeline")
 WORKSPACE_ROOT = os.path.abspath(os.getcwd())
 COLLECTION_NAME = "novus_guidelines"
 EMBEDDING_DIM = 256
+MAX_READ_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB safety limit
 
 _TECH_STOP_WORDS = {
     "the", "a", "an", "is", "it", "in", "of", "to", "and", "or", "for",
@@ -37,11 +38,32 @@ _TECH_STOP_WORDS = {
     "its", "their", "if", "else", "then", "all", "each", "any"
 }
 
+# Domain keyword expansions for high-precision semantic matching
+QUERY_EXPANSIONS = {
+    "async": ["asyncio", "httpx", "aiofiles", "taskgroup", "cancellederror", "concurrency"],
+    "blocking": ["asyncio", "httpx", "time.sleep", "thread", "io"],
+    "type": ["type hints", "mypy", "pyright", "pydantic", "strict", "union"],
+    "security": ["sanitization", "path traversal", "pydantic", "zod", "injection", "whitelist"],
+    "react": ["hooks", "usestate", "useeffect", "tanstack", "zustand", "context"],
+    "typescript": ["strict", "tsconfig", "zod", "interface", "type guard"],
+    "python2": ["print", "urllib2", "optparse", "subprocess", "future"],
+}
+
 
 def is_path_in_workspace(target_path: str) -> bool:
     """Ensure the path stays strictly within the configured workspace directory."""
     abs_target = os.path.abspath(target_path)
     return abs_target.startswith(WORKSPACE_ROOT)
+
+
+def expand_query(query: str) -> str:
+    """Expand natural language queries with domain tech synonyms for higher recall."""
+    tokens = set(re.findall(r"[a-z0-9]+", query.lower()))
+    expanded = set(tokens)
+    for key, synonyms in QUERY_EXPANSIONS.items():
+        if key in tokens:
+            expanded.update(synonyms)
+    return " ".join(expanded)
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +123,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
 def read_legacy_file(file_path: str) -> str:
     """
     Accepts a file path string; returns raw legacy code string.
-    Enforces security path traversal protection within workspace bounds.
+    Enforces security path traversal protection and max file size limits.
     """
     try:
         full_path = (
@@ -116,7 +138,14 @@ def read_legacy_file(file_path: str) -> str:
         if not os.path.exists(full_path):
             return f"Error: File '{file_path}' does not exist."
 
-        with open(full_path, "r", encoding="utf-8") as f:
+        file_size = os.path.getsize(full_path)
+        if file_size > MAX_READ_FILE_SIZE_BYTES:
+            return (
+                f"Error: File '{file_path}' is {file_size / (1024*1024):.2f}MB, "
+                f"exceeding the maximum allowed size limit of {MAX_READ_FILE_SIZE_BYTES / (1024*1024):.0f}MB."
+            )
+
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
             content = f.read()
         return content
     except Exception as e:
@@ -126,7 +155,7 @@ def read_legacy_file(file_path: str) -> str:
 @mcp.tool()
 def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> str:
     """
-    Query the RAG vector database for modernization and clean-code guidelines.
+    Query the RAG vector database for modernization and clean-code guidelines with hybrid search.
 
     Args:
         query:     Natural language query or code snippet to match against guidelines.
@@ -137,6 +166,10 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
     try:
         n_results = max(1, min(n_results, 10))
         chroma_dir = os.path.join(WORKSPACE_ROOT, ".chroma_db")
+        
+        # Expand query for domain synonyms
+        expanded_q = expand_query(query)
+        
         if os.path.exists(chroma_dir):
             try:
                 import chromadb
@@ -146,8 +179,9 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
 
                 where_filter = {"category": {"$eq": category.strip()}} if category.strip() else None
 
+                # Query with expanded search terms
                 results = collection.query(
-                    query_texts=[query],
+                    query_texts=[expanded_q],
                     n_results=n_results,
                     where=where_filter,
                     include=["documents", "metadatas", "distances"]
@@ -188,6 +222,80 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
         return f"Query: '{query}'\nMatched Compliance Guidelines (fallback):\n" + "\n".join(default_rules)
     except Exception as e:
         return f"Error querying RAG guidelines: {str(e)}"
+
+
+@mcp.tool()
+def search_rag_by_id(document_id: str) -> str:
+    """
+    Retrieve a specific modernization guideline document directly by its ID.
+
+    Args:
+        document_id: Unique document ID (e.g. 'py-001', 'ts-002', 'sec-001', 'clean-001').
+    """
+    try:
+        if not document_id.strip():
+            return "Error: document_id cannot be empty."
+
+        import chromadb
+        chroma_dir = os.path.join(WORKSPACE_ROOT, ".chroma_db")
+        if not os.path.exists(chroma_dir):
+            return f"Error: RAG database is not initialized. Run ingest_rag.py first."
+
+        client = chromadb.PersistentClient(path=chroma_dir)
+        ef = TFIDFEmbeddingFunction()
+        collection = client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
+
+        res = collection.get(ids=[document_id.strip()], include=["documents", "metadatas"])
+        docs = res.get("documents", [])
+        metas = res.get("metadatas", [])
+
+        if not docs:
+            return f"Error: Document with ID '{document_id}' was not found in the RAG database."
+
+        doc = docs[0]
+        meta = metas[0] if metas else {}
+        title = meta.get("title", "Guideline")
+        cat = meta.get("category", "")
+
+        return f"## RAG Guideline `{document_id}`: [{cat}] {title}\n\n{doc}"
+    except Exception as e:
+        return f"Error searching RAG document by ID '{document_id}': {str(e)}"
+
+
+@mcp.tool()
+def get_rag_stats() -> str:
+    """
+    Returns diagnostic statistics and status overview of the local RAG vector database.
+    """
+    try:
+        chroma_dir = os.path.join(WORKSPACE_ROOT, ".chroma_db")
+        if not os.path.exists(chroma_dir):
+            return "RAG Status: Database not initialized at '.chroma_db'."
+
+        import chromadb
+        client = chromadb.PersistentClient(path=chroma_dir)
+        ef = TFIDFEmbeddingFunction()
+
+        try:
+            collection = client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
+            count = collection.count()
+            all_res = collection.get(include=["metadatas"])
+            metas = all_res.get("metadatas", [])
+            categories = Counter(m.get("category", "unknown") for m in metas)
+
+            cat_str = "\n".join(f"  - `{cat}`: {num} documents" for cat, num in categories.items())
+            return (
+                f"## NovusPipeline RAG Database Overview\n\n"
+                f"- **Status**: Operational\n"
+                f"- **Storage Path**: `{chroma_dir}`\n"
+                f"- **Collection Name**: `{COLLECTION_NAME}`\n"
+                f"- **Total Guidelines**: {count}\n"
+                f"- **Category Breakdown**:\n{cat_str}"
+            )
+        except Exception as e:
+            return f"RAG Status: Collection '{COLLECTION_NAME}' error: {str(e)}"
+    except Exception as e:
+        return f"Error fetching RAG stats: {str(e)}"
 
 
 @mcp.tool()
@@ -240,16 +348,36 @@ def ingest_rag_document(document_id: str, title: str, category: str, content: st
 
 
 @mcp.tool()
+def reset_rag_database() -> str:
+    """
+    Programmatically resets and re-seeds the local RAG database with core enterprise guidelines.
+    """
+    try:
+        from ingest_rag import seed_rag_database
+        seed_rag_database(reset=True)
+        return "Successfully reset and re-seeded the RAG vector database."
+    except Exception as e:
+        return f"Error resetting RAG database: {str(e)}"
+
+
+@mcp.tool()
 def run_local_tests(command: str) -> str:
     """
     Accepts a test suite terminal command (e.g., 'pytest', 'npm test');
     executes inside workspace sandbox and returns standard out / error console text.
     """
     try:
-        parts = command.strip().split()
-        if not parts:
+        command_clean = command.strip()
+        if not command_clean:
             return "Error: Empty command specified."
 
+        # Prevent shell command chaining injection
+        dangerous_chars = [";", "&&", "||", "`", "$("]
+        for char in dangerous_chars:
+            if char in command_clean:
+                return f"Error: Command contains dangerous shell chaining character '{char}'."
+
+        parts = command_clean.split()
         allowed_executables = ["pytest", "python", "npm", "node", "unittest", "cargo", "go", "mvn", "gradle"]
         executable_basename = os.path.basename(parts[0]).lower().replace(".exe", "").replace(".cmd", "")
 
