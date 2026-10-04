@@ -10,6 +10,7 @@ Usage:
 """
 
 import os
+import hashlib
 import math
 import re
 from collections import Counter
@@ -28,6 +29,17 @@ _TECH_STOP_WORDS = {
     "use", "are", "was", "were", "has", "have", "do", "does",
     "its", "their", "if", "else", "then", "all", "each", "any"
 }
+
+
+def stable_token_index(token: str, dim: int) -> int:
+    """Deterministic token -> dimension index, stable across processes/restarts.
+
+    Python's builtin hash() is salted per-process (PYTHONHASHSEED), which would
+    silently desync the embedding space between this ingest process and any later
+    query process (server.py) against the same persistent ChromaDB collection.
+    """
+    digest = hashlib.md5(token.encode("utf-8")).hexdigest()
+    return int(digest, 16) % dim
 
 
 class TFIDFEmbeddingFunction(EmbeddingFunction):
@@ -56,7 +68,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
         vec = [0.0] * EMBEDDING_DIM
         for token, count in tf.items():
             weight = math.log(1 + count / total) * idf.get(token, 1.0)
-            idx = hash(token) % EMBEDDING_DIM
+            idx = stable_token_index(token, EMBEDDING_DIM)
             vec[idx] += weight
             vec[(idx + 1) % EMBEDDING_DIM] += weight * 0.3
             vec[(idx - 1) % EMBEDDING_DIM] += weight * 0.3

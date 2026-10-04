@@ -14,6 +14,7 @@ logging.root.addHandler(stderr_handler)
 os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
 os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
 
+import hashlib
 import math
 import re
 import subprocess
@@ -54,10 +55,21 @@ QUERY_EXPANSIONS = {
 }
 
 
+def stable_token_index(token: str, dim: int) -> int:
+    """Deterministic token -> dimension index, stable across processes/restarts.
+
+    Python's builtin hash() is salted per-process (PYTHONHASHSEED), which would
+    silently desync the embedding space between the ingest process and any later
+    query process against the same persistent ChromaDB collection.
+    """
+    digest = hashlib.md5(token.encode("utf-8")).hexdigest()
+    return int(digest, 16) % dim
+
+
 def is_path_in_workspace(target_path: str) -> bool:
     """Ensure the path stays strictly within the configured workspace directory."""
     abs_target = os.path.abspath(target_path)
-    return abs_target.startswith(WORKSPACE_ROOT)
+    return abs_target == WORKSPACE_ROOT or abs_target.startswith(WORKSPACE_ROOT + os.sep)
 
 
 def expand_query(query: str) -> str:
@@ -101,7 +113,7 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
         vec = [0.0] * EMBEDDING_DIM
         for token, count in tf.items():
             weight = math.log(1 + count / total) * idf.get(token, 1.0)
-            idx = hash(token) % EMBEDDING_DIM
+            idx = stable_token_index(token, EMBEDDING_DIM)
             vec[idx] += weight
             vec[(idx + 1) % EMBEDDING_DIM] += weight * 0.3
             vec[(idx - 1) % EMBEDDING_DIM] += weight * 0.3

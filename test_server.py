@@ -16,6 +16,8 @@ from server import (
     generate_llm_modernization_proposal,
     format_modernization_report,
     finalize_git_migration_pr,
+    is_path_in_workspace,
+    stable_token_index,
 )
 from modernizer import LegacySmellDetector, CodeModernizer
 import local_llm
@@ -31,6 +33,18 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
     def test_read_legacy_file_security_path_traversal(self):
         res = read_legacy_file("../../Windows/System32/drivers/etc/hosts")
         self.assertIn("outside authorized project workspace", res)
+
+    def test_is_path_in_workspace_rejects_sibling_directory_prefix(self):
+        # A sibling directory that merely shares the workspace root as a string
+        # prefix (e.g. "...\NovusPipelineEVIL") must NOT be treated as in-workspace.
+        workspace_root = os.path.abspath(os.getcwd())
+        sibling_path = workspace_root + "EVIL" + os.sep + "secret.txt"
+        self.assertFalse(is_path_in_workspace(sibling_path))
+
+    def test_is_path_in_workspace_accepts_real_subpath_and_root(self):
+        workspace_root = os.path.abspath(os.getcwd())
+        self.assertTrue(is_path_in_workspace(os.path.join(workspace_root, "server.py")))
+        self.assertTrue(is_path_in_workspace(workspace_root))
 
     def test_query_rag_guidelines_basic(self):
         res = query_rag_guidelines("refactor python 2 print statement")
@@ -62,6 +76,30 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
         res = search_rag_by_id("nonexistent-id-999")
         self.assertIn("Error", res)
         self.assertIn("was not found", res)
+
+    def test_stable_token_index_deterministic_across_processes(self):
+        # Must not rely on Python's salted builtin hash() - ingestion (ingest_rag.py)
+        # and querying (server.py) run as separate processes against the same
+        # persistent ChromaDB collection, so the token->dimension mapping must be
+        # identical every time regardless of PYTHONHASHSEED.
+        import subprocess
+        import sys
+
+        script = (
+            "import hashlib; "
+            "from server import stable_token_index; "
+            "print(stable_token_index('python', 256))"
+        )
+        results = set()
+        for _ in range(2):
+            out = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=os.getcwd(),
+                capture_output=True,
+                text=True,
+            )
+            results.add(out.stdout.strip())
+        self.assertEqual(len(results), 1, f"stable_token_index varied across processes: {results}")
 
     def test_get_rag_stats(self):
         res = get_rag_stats()
