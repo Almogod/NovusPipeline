@@ -18,9 +18,12 @@ from server import (
     finalize_git_migration_pr,
     is_path_in_workspace,
     stable_token_index,
+    get_gnn_model_status,
+    analyze_code_structure_gnn,
 )
 from modernizer import LegacySmellDetector, CodeModernizer
 import local_llm
+from code_graph import build_graph_from_code, NODE_TYPES
 from reporter import ModernizationReporter
 
 
@@ -264,6 +267,49 @@ class TestNovusPipelineServerPhase3(unittest.TestCase):
     def test_format_modernization_report(self):
         res = format_modernization_report("README.md", branch_name="test-report-branch-tool", test_command="python --version")
         self.assertIn("Successfully generated and saved Modernization Report artifact", res)
+
+    # -----------------------------------------------------------------------
+    # Phase 5 Tests: AST Graph Construction & GNN Structural Classifier
+    # -----------------------------------------------------------------------
+
+    def test_build_graph_from_code_structure(self):
+        code = "import urllib2\ntry:\n    pass\nexcept:\n    pass\n"
+        graph = build_graph_from_code(code)
+        self.assertGreater(graph["num_nodes"], 0)
+        self.assertEqual(len(graph["node_type_ids"]), graph["num_nodes"])
+        self.assertEqual(len(graph["node_features"]), graph["num_nodes"])
+        self.assertTrue(all(0 <= t < len(NODE_TYPES) for t in graph["node_type_ids"]))
+        self.assertGreater(len(graph["edge_index"]), 0)
+
+    def test_build_graph_from_code_invalid_syntax_raises(self):
+        with self.assertRaises(SyntaxError):
+            build_graph_from_code("def broken(:\n")
+
+    def test_get_gnn_model_status(self):
+        res = get_gnn_model_status()
+        self.assertIn("GNN Structural Smell Classifier Status", res)
+        self.assertIn("Torch Available", res)
+
+    def test_analyze_code_structure_gnn_rejects_non_python(self):
+        res = analyze_code_structure_gnn("rules.md")
+        self.assertIn("Error", res)
+        self.assertIn("Python", res)
+
+    def test_analyze_code_structure_gnn_on_smelly_file(self):
+        test_file = "sample_gnn_smelly.py"
+        with open(test_file, "w", encoding="utf-8") as f:
+            f.write("import pickle\ndef load(path):\n    try:\n        with open(path, 'rb') as f:\n            return pickle.loads(f.read())\n    except:\n        return None\n")
+
+        try:
+            res = analyze_code_structure_gnn(test_file)
+            if "GNN model unavailable" in res:
+                self.skipTest("GNN checkpoint not trained in this environment; run train_gnn.py first.")
+            self.assertIn("GNN Structural Analysis", res)
+            self.assertIn("PY-SMELL-003", res)
+            self.assertIn("PY-SMELL-005", res)
+        finally:
+            if os.path.exists(test_file):
+                os.remove(test_file)
 
     def test_finalize_git_migration_pr(self):
         lock_file = os.path.join(os.getcwd(), ".git", "index.lock")

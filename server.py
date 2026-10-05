@@ -24,6 +24,7 @@ from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
 from modernizer import LegacySmellDetector, CodeModernizer
 import local_llm
+import gnn_model
 from reporter import ModernizationReporter
 
 # ---------------------------------------------------------------------------
@@ -560,6 +561,22 @@ def analyze_legacy_codebase(file_path: str) -> str:
             rag_res = query_rag_guidelines(query, category=f["category"], n_results=1)
             report.append(f"**Recommended Guideline**:\n{rag_res}\n\n---\n")
 
+        if file_path.endswith(".py"):
+            try:
+                probs = gnn_model.predict_smells(code)
+                rule_based_ids = {f["smell_id"] for f in findings}
+                report.append("### 🧠 Structural GNN Cross-Check")
+                report.append(
+                    "Graph Neural Network prediction from AST structure alone (no text/regex matching), "
+                    "for comparison against the rule-based findings above:\n"
+                )
+                for smell_id, prob in probs.items():
+                    flag = "⚠️ Likely Present" if prob > 0.5 else "OK"
+                    agreement = "agrees" if (prob > 0.5) == (smell_id in rule_based_ids) else "DISAGREES"
+                    report.append(f"- `{smell_id}`: {prob:.3f} ({flag}, rule-engine {agreement})")
+            except (RuntimeError, SyntaxError) as e:
+                report.append(f"### 🧠 Structural GNN Cross-Check\nUnavailable: {e}")
+
         return "\n".join(report)
     except Exception as e:
         return f"Error analyzing legacy codebase for '{file_path}': {str(e)}"
@@ -789,6 +806,81 @@ def finalize_git_migration_pr(
         )
     except Exception as e:
         return f"Error finalizing Git migration PR for branch '{branch_name}': {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: GNN Structural Code-Smell Classifier
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def get_gnn_model_status() -> str:
+    """
+    Phase 5 Tool: Returns status/metadata for the trained Graph Neural Network
+    structural code-smell classifier (trained via `train_gnn.py`).
+    """
+    try:
+        status = gnn_model.get_gnn_status()
+        meta = status.get("metadata", {})
+        lines = [
+            "## GNN Structural Smell Classifier Status\n",
+            f"- **Checkpoint Path**: `{status['checkpoint_path']}`",
+            f"- **Checkpoint Trained**: {status['checkpoint_exists']}",
+            f"- **Torch Available**: {status['torch_available']}",
+            f"- **Supported Labels**: {', '.join(status['labels'])}",
+        ]
+        if status.get("torch_error"):
+            lines.append(f"- **Torch Error**: {status['torch_error']}")
+        if status.get("load_error"):
+            lines.append(f"- **Load Error**: {status['load_error']}")
+        if meta:
+            lines.append(f"- **Trained At**: {meta.get('trained_at', 'unknown')}")
+            lines.append(f"- **Validation Exact-Match Accuracy**: {meta.get('exact_match_accuracy', 'n/a')}")
+            per_label = meta.get("per_label_accuracy", {})
+            if per_label:
+                lines.append("- **Per-Label Validation Accuracy**:")
+                for label, acc in per_label.items():
+                    lines.append(f"  - `{label}`: {acc}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting GNN model status: {str(e)}"
+
+
+@mcp.tool()
+def analyze_code_structure_gnn(file_path: str) -> str:
+    """
+    Phase 5 Tool: Runs the trained Graph Neural Network over a Python file's AST
+    graph to predict structural code smells, independent of the regex/text-based
+    detector in `analyze_legacy_codebase`. Python files only (requires a
+    syntactically valid AST).
+
+    Args:
+        file_path: Target relative or absolute Python file path to analyze.
+    """
+    try:
+        if not file_path.endswith(".py"):
+            return f"Error: GNN structural analysis currently only supports Python ('.py') files, got '{file_path}'."
+
+        code = read_legacy_file(file_path)
+        if code.startswith("Error:"):
+            return code
+
+        probs = gnn_model.predict_smells(code)
+
+        lines = [f"## GNN Structural Analysis for `{file_path}`\n"]
+        for smell_id, prob in sorted(probs.items(), key=lambda kv: kv[1], reverse=True):
+            flag = "⚠️ Likely Present" if prob > 0.5 else "OK"
+            lines.append(f"- `{smell_id}`: **{prob:.3f}** ({flag})")
+        lines.append(
+            "\n_Predicted from AST graph structure only (no token/text matching); "
+            "treat as a complementary structural signal to `analyze_legacy_codebase`, not a replacement._"
+        )
+        return "\n".join(lines)
+    except SyntaxError as e:
+        return f"Error: '{file_path}' is not valid Python 3 syntax, cannot build AST graph: {str(e)}"
+    except RuntimeError as e:
+        return f"Error: GNN model unavailable: {str(e)}"
+    except Exception as e:
+        return f"Error running GNN structural analysis on '{file_path}': {str(e)}"
 
 
 if __name__ == "__main__":
