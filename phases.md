@@ -45,3 +45,34 @@
 - [x] Expose `format_modernization_report` MCP tool saving structured audit reports under `reports/modernization_report_<branch>.md`.
 - [x] Expose `finalize_git_migration_pr` MCP tool managing complete draft PR metadata, commit verification, and `gh` CLI command instructions.
 - [x] Expand comprehensive unit test suite to **26/26 tests passing** cleanly in `test_server.py`.
+
+## Phase 5: GNN Structural Code-Smell Classifier (COMPLETED)
+- [x] Implement `code_graph.py`: converts Python source into a typed AST graph
+  (nodes = AST node types, edges = parent-child + next-sibling control-flow),
+  zero-dependency on torch so graph construction is independently testable.
+- [x] Implement `gnn_model.py`: a 3-layer PyTorch Geometric GCN (`SmellGNN`)
+  with learned node-type embeddings, mean+max graph pooling, and a multi-label
+  classification head over `PY-SMELL-002..006`.
+- [x] Implement `train_gnn.py`: generates a synthetic template-based corpus,
+  weak-labels it via the existing `LegacySmellDetector` (distillation), and
+  trains/evaluates the GNN, saving a checkpoint under `.gnn_model/` (gitignored,
+  regenerate via `python train_gnn.py`).
+- [x] Expose `get_gnn_model_status` and `analyze_code_structure_gnn` MCP tools;
+  append a structural GNN cross-check section to `analyze_legacy_codebase`.
+- [x] Expand unit test suite to **34/34 tests passing**, covering graph
+  construction and GNN inference.
+- [x] Add pinned `requirements.txt` (previously missing; also needed for the
+  new torch/torch-geometric dependency).
+
+### Known limitations / follow-ups for industry-readiness
+- GNN is trained on a synthetic, template-generated corpus (weak supervision
+  from the rule-based detector), not real-world labeled code — expect lower
+  accuracy on unfamiliar code shapes until trained on real repositories.
+- Training is not fully deterministic: only Python's `random` module is
+  seeded; `torch`'s RNG (weight init, DataLoader shuffling) is not, so
+  re-running `train_gnn.py` yields slightly different metrics each time.
+- `test_create_git_migration_pr`, `test_run_autonomous_modernization_pipeline`,
+  and `test_finalize_git_migration_pr` call the real git-mutating tools
+  against this actual repository (creating/checking out branches, committing),
+  which can silently discard uncommitted working-tree changes to tracked
+  files on branch switch. Should be isolated to a temp git fixture.

@@ -5,3 +5,4 @@
 - **Vector DB**: ChromaDB for local embedding storage & query retrieval.
 - **Git Integration**: GitPython for staging, branch creation, and PR drafting.
 - **Verification Engine**: Subprocess execution sandbox with command whitelisting.
+- **Structural Code Intelligence**: PyTorch Geometric GCN (`gnn_model.py`) over AST graphs (`code_graph.py`) for learned, structure-based code-smell classification, trained via distillation from the rule-based detector (`train_gnn.py`).
