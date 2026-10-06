@@ -29,8 +29,8 @@ import random
 import statistics
 import sysconfig
 import time
-from dataclasses import replace
-from typing import Dict, List, Optional, Tuple
+from dataclasses import asdict, replace
+from typing import Callable, Dict, List, Optional, Tuple
 
 from code_graph import build_graph_from_code
 from gnn_model import SMELL_LABELS, GNNConfig, build_model, graph_dict_to_pyg_data, save_checkpoint
@@ -240,7 +240,8 @@ def _function_nodes(module: ast.Module) -> List[ast.AST]:
 
 def real_code_corpus(root: str, num_samples: int, seed: int, max_nodes: int = 2500,
                      augment: bool = False, functions_per_chunk: int = 0,
-                     exclude_dirs: Tuple[str, ...] = ("test", "tests", "site-packages", "lib2to3", "idlelib")
+                     exclude_dirs: Tuple[str, ...] = ("test", "tests", "site-packages", "lib2to3", "idlelib"),
+                     path_filter: Optional[Callable[[str], bool]] = None,
                      ) -> List[Tuple[str, List[float], str]]:
     """
     Teacher-labeled chunks of real Python source under `root`. Each file's
@@ -260,6 +261,8 @@ def real_code_corpus(root: str, num_samples: int, seed: int, max_nodes: int = 25
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(d for d in dirnames if d not in exclude_dirs and not d.startswith("."))
         paths.extend(os.path.join(dirpath, f) for f in sorted(filenames) if f.endswith(".py"))
+    if path_filter is not None:
+        paths = [p for p in paths if path_filter(p)]
     rng = random.Random(seed)
     rng.shuffle(paths)
 
@@ -307,6 +310,51 @@ def stdlib_root() -> str:
     return sysconfig.get_paths()["stdlib"]
 
 
+def site_packages_root() -> str:
+    return sysconfig.get_paths()["purelib"]
+
+
+def _bucket(name: str) -> int:
+    return int(hashlib.md5(name.encode()).hexdigest(), 16) % 100
+
+
+def package_split(package: str) -> str:
+    """Whole third-party packages go to one split, so test packages are never seen in training."""
+    b = _bucket(package)
+    return "train" if b < 70 else "val" if b < 85 else "test"
+
+
+def stdlib_split(path: str) -> str:
+    b = _bucket(os.path.basename(path))
+    return "val" if b < 15 else "test" if b < 30 else "train"
+
+
+def list_packages(root: str) -> List[str]:
+    """Top-level importable packages (directories with Python files) under a site-packages dir."""
+    out = []
+    for name in sorted(os.listdir(root)):
+        full = os.path.join(root, name)
+        if (os.path.isdir(full) and not name.startswith(("_", ".")) and name != "__pycache__"
+                and not name.endswith((".dist-info", ".egg-info", ".data"))
+                and any(f.endswith(".py") for _, _, files in os.walk(full) for f in files)):
+            out.append(name)
+    return out
+
+
+def package_corpus(split: str, chunks_per_package: int, seed: int, augment: bool,
+                   functions_per_chunk: int, root: Optional[str] = None) -> List[Tuple[str, List[float], str]]:
+    """Teacher-labeled chunks from every installed package assigned to `split`, capped per
+    package so giants (torch, sympy, kubernetes) do not dominate."""
+    root = root or site_packages_root()
+    samples: List[Tuple[str, List[float], str]] = []
+    for package in list_packages(root):
+        if package_split(package) == split:
+            for code, label, _ in real_code_corpus(os.path.join(root, package), chunks_per_package, seed,
+                                                   augment=augment, functions_per_chunk=functions_per_chunk):
+                samples.append((code, label, package))
+    return samples
+
+
 # ---------------------------------------------------------------------------
 # Training / evaluation
 # ---------------------------------------------------------------------------
@@ -315,15 +363,19 @@ def _to_dataset(samples):
     return [graph_dict_to_pyg_data(build_graph_from_code(code), y=label) for code, label in samples]
 
 
-def _predict(model, loader):
+def _predict(models, loader, device: str = "cpu"):
+    """Probabilities averaged over `models` (one model or an ensemble), and targets."""
     import torch
 
-    model.eval()
+    models = models if isinstance(models, list) else [models]
+    for m in models:
+        m.eval()
     probs, targets = [], []
     with torch.no_grad():
         for batch in loader:
-            probs.append(torch.sigmoid(model(batch, batch.batch)))
-            targets.append(batch.y)
+            batch = batch.to(device)
+            probs.append(torch.stack([torch.sigmoid(m(batch, batch.batch)) for m in models]).mean(dim=0).cpu())
+            targets.append(batch.y.cpu())
     return torch.cat(probs), torch.cat(targets)
 
 
@@ -350,121 +402,178 @@ def evaluate_split(probs, targets, thresholds: Dict[str, float]) -> Dict[str, ob
     preds = (probs > probs.new_tensor([thresholds[l] for l in SMELL_LABELS])).float()
     per_label: Dict[str, Optional[float]] = {}
     fp_rate: Dict[str, float] = {}
+    support: Dict[str, int] = {}
     for i, label in enumerate(SMELL_LABELS):
         positives = float(targets[:, i].sum())
         negatives = len(targets) - positives
+        support[label] = int(positives)
         per_label[label] = round(_f1(preds[:, i], targets[:, i]), 4) if positives else None
         fp_rate[label] = round(float((preds[:, i] * (1 - targets[:, i])).sum()) / negatives, 4) if negatives else 0.0
     supported = [f1 for f1 in per_label.values() if f1 is not None]
+    # With a handful of positives a label's F1 is a coin flip; selection should ignore it.
+    reliable = [per_label[l] for l in SMELL_LABELS if support[l] >= MIN_SUPPORT_FOR_SELECTION]
     return {
         "macro_f1": round(sum(supported) / len(supported), 4) if supported else None,
+        "reliable_macro_f1": round(sum(reliable) / len(reliable), 4) if reliable else None,
         "per_label_f1": per_label,
+        "support": support,
         "false_positive_rate": fp_rate,
         "exact_match": round(float((preds == targets).all(dim=1).float().mean()), 4),
         "samples": len(targets),
     }
 
 
-def build_datasets(seed: int, num_samples: int = 2000, real_samples: int = 2000) -> Dict[str, list]:
-    """Seeded train/val/test (+ real-code-only test) PyG datasets. Independent of model config,
-    so a sweep can build them once per seed and reuse them across architectures."""
+DATASET_DEFAULTS = {"num_samples": 2000, "real_samples": 2000, "package_chunks": 25}
+MIN_SUPPORT_FOR_SELECTION = 10
+# Splits the model never trains on; "val*" select models/thresholds, "test*" are reported once.
+EVAL_SPLITS = ("val", "val_real", "test", "test_real", "test_external")
+
+
+def build_datasets(seed: int, num_samples: int = 2000, real_samples: int = 2000,
+                   package_chunks: int = 25) -> Dict[str, list]:
+    """
+    Seeded PyG datasets, independent of model config (a sweep builds them once per seed):
+      train          synthetic + stdlib train files + train packages (counterfactually augmented)
+      val / val_real all validation data / its real-code part (stdlib val files + val packages)
+      test           synthetic test + stdlib test files
+      test_real      stdlib test files
+      test_external  held-out third-party packages, raw (the closest proxy for unseen codebases)
+    Only training data is augmented, so every evaluation split is real-world distributed.
+    Any evaluation sample whose source also occurs in training is dropped (no leakage).
+    """
     synthetic = generate_corpus(num_samples, seed)
     random.Random(seed).shuffle(synthetic)
     n_train, n_val = int(0.7 * len(synthetic)), int(0.15 * len(synthetic))
-    splits = {"train": synthetic[:n_train], "val": synthetic[n_train:n_train + n_val],
-              "test": synthetic[n_train + n_val:]}
-
-    # Real chunks are split by source file (not by chunk) so near-duplicate
-    # chunks of one module never straddle train and test.
-    real_test: List[Tuple[str, List[float]]] = []
-    if real_samples:
-        for code, label, path in real_code_corpus(stdlib_root(), real_samples, seed, augment=True,
-                                                  functions_per_chunk=3):
-            bucket = int(hashlib.md5(os.path.basename(path).encode()).hexdigest(), 16) % 100
-            split = "val" if bucket < 15 else "test" if bucket < 30 else "train"
-            splits[split].append((code, label))
-            if split == "test":
-                real_test.append((code, label))
-
-    return {
-        "train": _to_dataset(splits["train"]),
-        "val": _to_dataset(splits["val"]),
-        "test": _to_dataset(splits["test"]),
-        "test_real": _to_dataset(real_test),
+    raw: Dict[str, List[Tuple[str, List[float]]]] = {
+        "train": synthetic[:n_train], "val": synthetic[n_train:n_train + n_val],
+        "test": synthetic[n_train + n_val:], "val_real": [], "test_real": [], "test_external": [],
     }
 
+    if real_samples:
+        std = stdlib_root()
+        for code, label, _ in real_code_corpus(std, real_samples, seed, augment=True, functions_per_chunk=3,
+                                               path_filter=lambda p: stdlib_split(p) == "train"):
+            raw["train"].append((code, label))
+        for code, label, path in real_code_corpus(std, real_samples, seed, functions_per_chunk=3,
+                                                  path_filter=lambda p: stdlib_split(p) != "train"):
+            split = stdlib_split(path)
+            raw[split].append((code, label))
+            raw[f"{split}_real"].append((code, label))
 
-def run_training(config: GNNConfig, seed: int, num_samples: int = 2000, real_samples: int = 2000,
-                 max_epochs: int = 80, patience: int = 10, save: bool = True,
-                 verbose: bool = True, datasets: Optional[Dict[str, list]] = None) -> Dict[str, object]:
+    if package_chunks:
+        raw["train"] += [(c, l) for c, l, _ in package_corpus("train", package_chunks, seed, True, 2)]
+        val_pkgs = [(c, l) for c, l, _ in package_corpus("val", package_chunks, seed, False, 3)]
+        raw["val"] += val_pkgs
+        raw["val_real"] += val_pkgs
+        raw["test_external"] += [(c, l) for c, l, _ in package_corpus("test", package_chunks, seed, False, 3)]
+
+    seen = {hashlib.sha1(code.encode()).hexdigest() for code, _ in raw["train"]}
+    for split in EVAL_SPLITS:
+        unique, kept = set(), []
+        for code, label in raw[split]:
+            h = hashlib.sha1(code.encode()).hexdigest()
+            if h not in seen and h not in unique:
+                unique.add(h)
+                kept.append((code, label))
+        raw[split] = kept
+
+    return {name: _to_dataset(samples) for name, samples in raw.items()}
+
+
+def resolve_device(device: str = "auto") -> str:
+    import torch
+    return ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
+
+
+def _train_member(config: GNNConfig, seed: int, datasets: Dict[str, list], device: str, lr: float,
+                  max_epochs: int, patience: int, log) -> Tuple[object, int]:
+    """Trains one model with early stopping on validation BCE; returns (best model, epochs run)."""
     import torch
     from torch_geometric.loader import DataLoader
 
     random.seed(seed)
     torch.manual_seed(seed)
-    log = print if verbose else (lambda *a, **k: None)
-
-    datasets = datasets or build_datasets(seed, num_samples, real_samples)
-    train_set, val_set = datasets["train"], datasets["val"]
-    test_set, real_test_set = datasets["test"], datasets["test_real"]
-
+    train_set = datasets["train"]
     label_rate = torch.cat([d.y for d in train_set]).mean(dim=0)
-    log(f"[NovusPipeline GNN] {len(train_set)}/{len(val_set)}/{len(test_set)} train/val/test graphs, "
-        f"label rates {dict(zip(SMELL_LABELS, [round(float(r), 2) for r in label_rate]))}")
+    train_loader = DataLoader(train_set, batch_size=32, shuffle=True, generator=torch.Generator().manual_seed(seed))
+    val_loader = DataLoader(datasets["val"], batch_size=64)
 
-    generator = torch.Generator().manual_seed(seed)
-    train_loader = DataLoader(train_set, batch_size=32, shuffle=True, generator=generator)
-    val_loader = DataLoader(val_set, batch_size=64)
-    test_loader = DataLoader(test_set, batch_size=64)
-
-    model = build_model(config)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-3, weight_decay=1e-4)
-    pos_weight = ((1 - label_rate) / label_rate.clamp(min=1e-3)).clamp(1.0, 10.0)
+    model = build_model(config).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=max(2, patience // 3))
+    pos_weight = ((1 - label_rate) / label_rate.clamp(min=1e-3)).clamp(1.0, 10.0).to(device)
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
-    best_loss, best_state, bad_epochs = float("inf"), None, 0
+    best_loss, best_state, bad_epochs, epoch = float("inf"), None, 0, 0
     start = time.perf_counter()
     for epoch in range(1, max_epochs + 1):
         model.train()
         for batch in train_loader:
+            batch = batch.to(device)
             optimizer.zero_grad()
             loss = criterion(model(batch, batch.batch), batch.y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
 
-        val_probs, val_targets = _predict(model, val_loader)
+        val_probs, val_targets = _predict(model, val_loader, device)
         val_loss = float(torch.nn.functional.binary_cross_entropy(val_probs.clamp(1e-6, 1 - 1e-6), val_targets))
-        if val_loss < best_loss - 1e-4:
+        scheduler.step(val_loss)
+        if val_loss < best_loss - 1e-5:
             best_loss, bad_epochs = val_loss, 0
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         else:
             bad_epochs += 1
         if epoch % 5 == 0:
-            log(f"[NovusPipeline GNN] epoch {epoch:3d}  val BCE {val_loss:.4f}  (best {best_loss:.4f})  "
+            log(f"[NovusPipeline GNN] seed {seed} epoch {epoch:3d}  val BCE {val_loss:.5f}  (best {best_loss:.5f})  "
                 f"{(time.perf_counter() - start) / epoch:.1f}s/epoch")
         if bad_epochs >= patience:
-            log(f"[NovusPipeline GNN] early stop at epoch {epoch}")
+            log(f"[NovusPipeline GNN] seed {seed} early stop at epoch {epoch}")
             break
 
     model.load_state_dict(best_state)
-    val_probs, val_targets = _predict(model, val_loader)
+    return model, epoch
+
+
+def run_training(config: GNNConfig, seed: int, num_samples: int = 2000, real_samples: int = 2000,
+                 max_epochs: int = 80, patience: int = 10, save: bool = True, verbose: bool = True,
+                 datasets: Optional[Dict[str, list]] = None, ensemble: int = 1, lr: float = 2e-3,
+                 device: str = "auto", package_chunks: int = 25) -> Dict[str, object]:
+    """
+    Trains `ensemble` models (seeds seed..seed+ensemble-1) on the same data; thresholds are
+    calibrated on the ensemble's averaged validation probabilities. Returns metrics for every
+    evaluation split.
+    """
+    from torch_geometric.loader import DataLoader
+
+    log = print if verbose else (lambda *a, **k: None)
+    device = resolve_device(device)
+    datasets = datasets or build_datasets(seed, num_samples, real_samples, package_chunks)
+    log(f"[NovusPipeline GNN] device {device}; " + ", ".join(f"{k}={len(v)}" for k, v in datasets.items()))
+
+    members, epochs = [], []
+    for member_seed in range(seed, seed + ensemble):
+        model, n_epochs = _train_member(config, member_seed, datasets, device, lr, max_epochs, patience, log)
+        members.append(model)
+        epochs.append(n_epochs)
+
+    loader = lambda name: DataLoader(datasets[name], batch_size=64)
+    val_probs, val_targets = _predict(members, loader("val"), device)
     thresholds = calibrate_thresholds(val_probs, val_targets)
-    test_probs, test_targets = _predict(model, test_loader)
-    metrics = {
-        "seed": seed,
-        "epochs_trained": epoch,
-        "num_samples": num_samples,
-        "real_samples": real_samples,
-        "val": evaluate_split(val_probs, val_targets, thresholds),
-        "test": evaluate_split(test_probs, test_targets, thresholds),
-    }
-    if real_test_set:
-        real_probs, real_targets = _predict(model, DataLoader(real_test_set, batch_size=64))
-        metrics["test_real"] = evaluate_split(real_probs, real_targets, thresholds)
+    metrics: Dict[str, object] = {"seed": seed, "ensemble": ensemble, "lr": lr, "epochs_trained": epochs,
+                                  "num_samples": num_samples, "real_samples": real_samples,
+                                  "package_chunks": package_chunks, "split_sizes": {k: len(v) for k, v in datasets.items()}}
+    for name in EVAL_SPLITS:
+        if datasets.get(name):
+            probs, targets = _predict(members, loader(name), device)
+            metrics[name] = evaluate_split(probs, targets, thresholds)
+
     if save:
-        save_checkpoint(model, config, thresholds, metrics)
-        log(f"[NovusPipeline GNN] saved checkpoint; thresholds {thresholds}")
-    log(f"[NovusPipeline GNN] test metrics: {metrics['test']}")
+        save_checkpoint([m.cpu() for m in members], config, thresholds, metrics)
+        log(f"[NovusPipeline GNN] saved {ensemble}-member checkpoint; thresholds {thresholds}")
+    for name in EVAL_SPLITS:
+        if name in metrics:
+            log(f"[NovusPipeline GNN] {name:13s} {metrics[name]}")
     return metrics
 
 
@@ -475,34 +584,37 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--hidden", type=int)
     parser.add_argument("--no-tokens", action="store_true", help="ablation: drop identifier features")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--samples", type=int, default=2000, help="synthetic template samples")
-    parser.add_argument("--real-samples", type=int, default=2000,
-                        help="teacher-labeled chunks of real code from the Python stdlib (0 to disable)")
+    parser.add_argument("--dropout", type=float)
+    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--ensemble", type=int, default=1, help="number of seed-ensemble members")
+    parser.add_argument("--device", default="auto", help="auto | cpu | cuda")
+    parser.add_argument("--samples", type=int, default=DATASET_DEFAULTS["num_samples"], help="synthetic template samples")
+    parser.add_argument("--real-samples", type=int, default=DATASET_DEFAULTS["real_samples"],
+                        help="stdlib chunks per split pass (0 to disable)")
+    parser.add_argument("--package-chunks", type=int, default=DATASET_DEFAULTS["package_chunks"],
+                        help="chunks per installed third-party package (0 to disable)")
     parser.add_argument("--sweep", type=int, nargs="+", metavar="SEED",
-                        help="train once per seed without saving; report mean/std macro-F1 on "
-                             "held-out real-code files (the model-selection metric)")
+                        help="train once per seed without saving; report mean/std validation real-code "
+                             "macro-F1 (the model-selection metric; test splits are not used to select)")
     args = parser.parse_args(argv)
 
-    config = GNNConfig()
-    overrides = {k: v for k, v in {"conv": args.conv, "num_layers": args.layers,
-                                     "hidden_dim": args.hidden}.items() if v is not None}
+    overrides = {k: v for k, v in {"conv": args.conv, "num_layers": args.layers, "hidden_dim": args.hidden,
+                                     "dropout": args.dropout}.items() if v is not None}
     if args.no_tokens:
         overrides["use_tokens"] = False
-    config = replace(config, **overrides)
+    config = replace(GNNConfig(), **overrides)
+    common = dict(num_samples=args.samples, real_samples=args.real_samples, package_chunks=args.package_chunks,
+                  lr=args.lr, device=args.device)
 
     if args.sweep:
-        runs = [run_training(config, s, args.samples, args.real_samples, save=False, verbose=False)
-                for s in args.sweep]
-        split = "test_real" if "test_real" in runs[0] else "test"
-        scores = [r[split]["macro_f1"] for r in runs]
+        runs = [run_training(config, s, save=False, verbose=False, **common) for s in args.sweep]
+        scores = [r["val_real"]["reliable_macro_f1"] for r in runs]
         std = statistics.stdev(scores) if len(scores) > 1 else 0.0
-        print(f"[NovusPipeline GNN] {config} -> {split} macro-F1 {statistics.mean(scores):.4f} +/- {std:.4f} "
-              f"{scores}; mixed test {[r['test']['macro_f1'] for r in runs]}; "
-              f"{split} per-label {[r[split]['per_label_f1'] for r in runs]}; "
-              f"{split} FP-rate {[r[split]['false_positive_rate'] for r in runs]}")
+        print(f"[NovusPipeline GNN] {asdict(config)} lr={args.lr} -> val_real reliable macro-F1 "
+              f"{statistics.mean(scores):.4f} +/- {std:.4f} {scores}")
         return
 
-    run_training(config, args.seed, args.samples, args.real_samples)
+    run_training(config, args.seed, ensemble=args.ensemble, **common)
 
 
 if __name__ == "__main__":

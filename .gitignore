@@ -1,8 +1,10 @@
 .venv/
+.venv-llm/
 __pycache__/
 *.pyc
 .chroma_db/
 .gnn_model/
 .novus_index/
+.llm_eval/
 *.bak
 .novus_pr_*.md

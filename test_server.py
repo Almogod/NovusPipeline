@@ -549,6 +549,172 @@ class TestContextTools(WorkspaceTestCase):
 
 
 # ---------------------------------------------------------------------------
+# Local LLM worker protocol (stub worker: no GPU or model needed)
+# ---------------------------------------------------------------------------
+
+STUB_WORKER = r'''
+import json, os, sys, time
+for line in sys.stdin:
+    req = json.loads(line)
+    if req["op"] == "generate":
+        mode = os.environ.get("STUB_MODE", "ok")
+        if mode == "crash":
+            sys.exit(3)
+        if mode == "hang":
+            time.sleep(60)
+        with open(os.environ["STUB_TEXT_FILE"], encoding="utf-8") as f:
+            text = f.read()
+        resp = {"id": req["id"], "ok": True, "text": text,
+                "stats": {"new_tokens": 5, "seconds": 0.1, "tokens_per_second": 50.0}}
+    elif req["op"] == "shutdown":
+        break
+    else:
+        resp = {"id": req["id"], "ok": True, "status": {"loaded": True, "device": "stub"}}
+    print(json.dumps(resp), flush=True)
+'''
+
+
+class StubWorkerTestCase(unittest.TestCase):
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        self.script = os.path.join(tmp.name, "stub_worker.py")
+        self.text_file = os.path.join(tmp.name, "reply.txt")
+        with open(self.script, "w", encoding="utf-8") as f:
+            f.write(STUB_WORKER)
+        self.reply("```python\nx: int = 1\n```")
+        env = {k: v for k, v in os.environ.items() if k != "NOVUS_FAST_TEST"}
+        env.update(NOVUS_LLM_PYTHON=sys.executable, STUB_TEXT_FILE=self.text_file, STUB_MODE="ok")
+        for patcher in (mock.patch.dict(os.environ, env, clear=True),
+                        mock.patch.object(local_llm, "WORKER_SCRIPT", self.script),
+                        mock.patch.object(local_llm, "_WORKER", local_llm.LLMWorker())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.addCleanup(lambda: local_llm._WORKER.stop())
+
+    def reply(self, text: str) -> None:
+        with open(self.text_file, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+class TestLlmWorkerProtocol(StubWorkerTestCase):
+
+    def test_round_trip_and_status_probe(self):
+        self.assertTrue(local_llm._WORKER.request("status", 30)["ok"])
+        self.assertTrue(local_llm.get_model_info(probe=True)["worker"]["loaded"])
+
+    def test_crash_is_reported_and_worker_restarts(self):
+        os.environ["STUB_MODE"] = "crash"
+        with self.assertRaisesRegex(RuntimeError, "exited unexpectedly"):
+            local_llm._WORKER.request("generate", 30, messages=[])
+        os.environ["STUB_MODE"] = "ok"
+        self.assertTrue(local_llm._WORKER.request("generate", 30, messages=[])["ok"])
+
+    def test_hang_times_out_and_kills_worker(self):
+        os.environ["STUB_MODE"] = "hang"
+        with self.assertRaises(TimeoutError):
+            local_llm._WORKER.request("generate", 2, messages=[])
+        self.assertFalse(local_llm._WORKER.running)
+
+    def test_proposal_extracted_and_validated(self):
+        self.reply("Here you go:\n```python\ndef to_int(s: str, default: int = 0) -> int:\n    try:\n"
+                   "        return int(s)\n    except ValueError:\n        return default\n```\n- typed")
+        legacy = "def to_int(s, default=0):\n    try:\n        return int(s)\n    except:\n        return default\n"
+        p = local_llm.propose_modernization(legacy, "rules", required_names=["to_int"])
+        self.assertEqual(p["engine"], local_llm.MODEL_NAME)
+        self.assertTrue(p["validation"]["valid"], p["validation"])
+        self.assertEqual(p["validation"]["resolved"], ["PY-SMELL-003", "PY-SMELL-006"])
+
+    def test_proposal_breaking_api_is_rejected(self):
+        self.reply("```python\ndef renamed() -> int:\n    return 0\n```")
+        p = local_llm.propose_modernization("def to_int(s):\n    return int(s)\n", "rules", required_names=["to_int"])
+        self.assertFalse(p["validation"]["valid"])
+        self.assertIn("to_int", " ".join(p["validation"]["issues"]))
+
+    def test_unavailable_worker_falls_back_to_rules(self):
+        os.environ["NOVUS_LLM_PYTHON"] = os.path.join(tempfile.gettempdir(), "no-such-python.exe")
+        p = local_llm.propose_modernization("try:\n    pass\nexcept:\n    pass\n", "rules")
+        self.assertEqual(p["engine"], "rule-based")
+        self.assertIn("except Exception:", p["code"])
+
+
+class TestPipelineWithLlm(WorkspaceTestCase, StubWorkerTestCase):
+
+    def setUp(self) -> None:
+        WorkspaceTestCase.setUp(self)
+        StubWorkerTestCase.setUp(self)
+        self.write("calc.py", "def to_int(s, default=0):\n    try:\n        return int(s)\n    except:\n        return default\n")
+        self.write("app.py", "from calc import to_int\n")
+        self.write("test_calc.py", "import unittest\nfrom calc import to_int\n\nclass T(unittest.TestCase):\n"
+                                   "    def test_parse(self):\n        self.assertEqual(to_int('x', 3), 3)\n")
+        self.commit_all()
+
+    def test_valid_llm_proposal_is_applied(self):
+        self.reply("```python\ndef to_int(s: str, default: int = 0) -> int:\n    try:\n        return int(s)\n"
+                   "    except (TypeError, ValueError):\n        return default\n```")
+        res = run_autonomous_modernization_pipeline("calc.py", use_llm=True, branch_name="llm-branch")
+        self.assertIn("Completed Successfully", res, res)
+        self.assertIn("(validated; resolved PY-SMELL-003, PY-SMELL-006)", res)
+        self.assertIn("except (TypeError, ValueError):", self.read("calc.py"))
+
+    def test_api_breaking_llm_proposal_falls_back_to_rules(self):
+        self.reply("```python\ndef parse(s: str) -> int:\n    return int(s)\n```")
+        res = run_autonomous_modernization_pipeline("calc.py", use_llm=True, branch_name="llm-branch")
+        self.assertIn("LLM proposal not used", res)
+        self.assertIn("to_int", res)
+        self.assertIn("def to_int(", self.read("calc.py"))
+        self.assertIn("except Exception:", self.read("calc.py"))
+
+
+# ---------------------------------------------------------------------------
+# MCP protocol (real server process over stdio)
+# ---------------------------------------------------------------------------
+
+class TestMcpProtocol(WorkspaceTestCase):
+
+    def test_server_over_stdio(self):
+        import asyncio
+        from fastmcp import Client
+        from fastmcp.client.transports import PythonStdioTransport
+        from fastmcp.exceptions import ToolError
+
+        self.write("lib.py", LEGACY_MODULE)
+        self.write("app.py", "from lib import fetch\n")
+        repo = os.path.dirname(os.path.abspath(__file__))
+        env = {**os.environ, "NOVUS_WORKSPACE_ROOT": self.root, "NOVUS_FAST_TEST": "1"}
+
+        async def scenario() -> None:
+            transport = PythonStdioTransport(script_path=os.path.join(repo, "server.py"), python_cmd=sys.executable,
+                                             cwd=repo, env=env)
+            async with Client(transport) as client:
+                tools = {t.name: t for t in await client.list_tools()}
+                self.assertEqual(len(tools), 21)
+                self.assertTrue(tools["get_file_context"].annotations.read_only_hint)
+                self.assertTrue(tools["run_autonomous_modernization_pipeline"].annotations.destructive_hint)
+                self.assertIn("files", tools["create_git_migration_pr"].input_schema["properties"])
+                self.assertIn("use_llm", tools["run_autonomous_modernization_pipeline"].input_schema["properties"])
+
+                prompts = {p.name for p in await client.list_prompts()}
+                self.assertIn("modernization_workflow", prompts)
+
+                overview = await client.call_tool("get_codebase_overview", {})
+                self.assertIn("`lib.py`", overview.content[0].text)
+
+                with self.assertRaises(ToolError):  # errors arrive as isError, not as normal text
+                    await client.call_tool("read_legacy_file", {"file_path": "../../outside.txt"})
+
+                results = await asyncio.gather(*[client.call_tool("get_file_context", {"file_path": "lib.py"})
+                                                 for _ in range(4)],
+                                               client.call_tool("analyze_legacy_codebase", {"file_path": "lib.py"}))
+                for r in results:
+                    self.assertFalse(r.is_error)
+                self.assertIn("Imported by 1 module(s)", results[0].content[0].text)
+
+        asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
 # LLM, reporting, GNN
 # ---------------------------------------------------------------------------
 

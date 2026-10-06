@@ -81,6 +81,35 @@ def _parse(code: str) -> Optional[ast.AST]:
         return None
 
 
+def top_level_names(code: str) -> Optional[set]:
+    """Names a module defines or imports at top level (what `from mod import x` can see); None if unparseable."""
+    tree = _parse(code)
+    if tree is None:
+        return None
+    names = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                names.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))
+        else:  # names defined under module-level `if` / `try`
+            names.update(n.name for n in ast.walk(node) if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
+            names.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
+    return names
+
+
+def missing_names(new_code: str, required: List[str]) -> List[str]:
+    """Names in `required` (e.g. symbols other modules import) that `new_code` no longer provides."""
+    names = top_level_names(new_code)
+    if names is None or "*" in names:
+        return []
+    return sorted(n for n in required if n not in names)
+
+
 # ---------------------------------------------------------------------------
 # Smell detection
 # ---------------------------------------------------------------------------

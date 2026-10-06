@@ -192,7 +192,13 @@ def get_gnn_status() -> Dict[str, Any]:
     }
 
 
+def _member_paths() -> List[str]:
+    members = _read_metadata().get("members") or [os.path.basename(CHECKPOINT_PATH)]
+    return [os.path.join(_MODEL_DIR, m) for m in members]
+
+
 def _load_model():
+    """List of ensemble members (a single-model checkpoint is a 1-member ensemble), or None."""
     global _MODEL, _MODEL_MTIME, _LOAD_ERROR
 
     if not os.path.exists(CHECKPOINT_PATH):
@@ -208,26 +214,40 @@ def _load_model():
     try:
         torch = _require_torch()
         config = GNNConfig(**_read_metadata().get("config", {}))
-        model = build_model(config)
-        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location="cpu"))
-        model.eval()
-        _MODEL, _MODEL_MTIME, _LOAD_ERROR = model, mtime, None
-        return model
+        members = []
+        for path in _member_paths():
+            model = build_model(config)
+            model.load_state_dict(torch.load(path, map_location="cpu"))
+            model.eval()
+            members.append(model)
+        _MODEL, _MODEL_MTIME, _LOAD_ERROR = members, mtime, None
+        return members
     except Exception as e:
         _MODEL = None
         _LOAD_ERROR = f"Failed to load GNN checkpoint: {e}"
         return None
 
 
+def _probs_and_embedding(members, data, batch):
+    """Ensemble-mean probabilities; embedding from member 0 (members' latent spaces differ)."""
+    torch = _require_torch()
+    embedding = members[0].encode(data, batch)
+    probs = torch.stack([torch.sigmoid(m.classifier(embedding if i == 0 else m.encode(data, batch)))
+                         for i, m in enumerate(members)]).mean(dim=0)
+    return probs, embedding
+
+
 def _run(code: str, encode_only: bool):
-    model = _load_model()
-    if model is None:
+    members = _load_model()
+    if members is None:
         raise RuntimeError(_LOAD_ERROR or "GNN model unavailable.")
     torch = _require_torch()
     data = graph_dict_to_pyg_data(build_graph_from_code(code))
     batch = torch.zeros(data.num_nodes, dtype=torch.long)
     with torch.no_grad():
-        return model.encode(data, batch) if encode_only else torch.sigmoid(model(data, batch))
+        if encode_only:
+            return members[0].encode(data, batch)
+        return _probs_and_embedding(members, data, batch)[0]
 
 
 def predict_smells(code: str) -> Dict[str, float]:
@@ -253,8 +273,8 @@ def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[s
     that input could not be turned into a graph (syntax error, too large, ...).
     Raises RuntimeError if the model itself is unavailable.
     """
-    model = _load_model()
-    if model is None:
+    members = _load_model()
+    if members is None:
         raise RuntimeError(_LOAD_ERROR or "GNN model unavailable.")
     torch = _require_torch()
     from torch_geometric.data import Batch
@@ -272,8 +292,7 @@ def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[s
         for start in range(0, len(valid), batch_size):
             idx = valid[start:start + batch_size]
             batch = Batch.from_data_list([graphs[i] for i in idx])
-            embeddings = model.encode(batch, batch.batch)
-            probs = torch.sigmoid(model.classifier(embeddings))
+            probs, embeddings = _probs_and_embedding(members, batch, batch.batch)
             for row, i in enumerate(idx):
                 results[i] = {
                     "probs": dict(zip(SMELL_LABELS, probs[row].tolist())),
@@ -282,16 +301,27 @@ def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[s
     return results
 
 
-def save_checkpoint(model, config: GNNConfig, thresholds: Dict[str, float], metrics: Dict[str, Any]) -> None:
+def save_checkpoint(models, config: GNNConfig, thresholds: Dict[str, float], metrics: Dict[str, Any]) -> None:
+    """Saves one model or an ensemble (list). Member 0 is always `smell_gnn.pt`."""
     torch = _require_torch()
+    models = models if isinstance(models, list) else [models]
     os.makedirs(_MODEL_DIR, exist_ok=True)
-    torch.save(model.state_dict(), CHECKPOINT_PATH)
+    names = [os.path.basename(CHECKPOINT_PATH)] + [f"smell_gnn_{i}.pt" for i in range(1, len(models))]
+    # Write extra members and metadata before member 0: its mtime is what triggers
+    # running servers to reload, so everything it refers to must already exist.
+    for name, model in list(zip(names, models))[1:]:
+        torch.save({k: v.cpu() for k, v in model.state_dict().items()}, os.path.join(_MODEL_DIR, name))
     metadata = {
         "trained_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "labels": SMELL_LABELS,
         "config": asdict(config),
         "thresholds": thresholds,
+        "members": names,
         **metrics,
     }
     with open(METADATA_PATH, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=2)
+    torch.save({k: v.cpu() for k, v in models[0].state_dict().items()}, CHECKPOINT_PATH)
+    for stale in os.listdir(_MODEL_DIR):
+        if stale.startswith("smell_gnn_") and stale.endswith(".pt") and stale not in names:
+            os.remove(os.path.join(_MODEL_DIR, stale))

@@ -1,150 +1,230 @@
 r"""
-local_llm.py — NovusPipeline Local LLM Modernization Engine
+local_llm.py — NovusPipeline Local LLM Modernization Engine (client side)
 
-Integrates the local fine-tuned Unsloth Qwen 3.5 2B model:
-    Path: C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774
+Talks to `llm_worker.py`, a separate process that hosts the fine-tuned Unsloth
+Qwen3.5-2B LoRA adapter on its base model. The worker runs under its own
+interpreter (NOVUS_LLM_PYTHON, default ./.venv-llm) so GPU dependencies and
+~4.5 GB of weights stay out of the MCP server process.
 
-Provides local model loading, prompt formatting using chat template,
-and inference for legacy code refactoring and modernization generation.
+Every proposal is validated before anyone may apply it: it must parse, must not
+introduce rule-engine smells, and must keep every symbol other modules import.
+Without a worker (or with NOVUS_FAST_TEST=1) the rule-based modernizer is used.
 """
 
-import os
-import sys
+import json
 import logging
-from typing import Dict, Any, Optional
+import os
+import queue
+import re
+import subprocess
+import sys
+import threading
+from collections import Counter
+from typing import Any, Dict, List, Optional
 
-LOCAL_MODEL_PATH = r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+LOCAL_MODEL_PATH = os.environ.get(
+    "NOVUS_LLM_PATH", r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774")
+MODEL_NAME = os.path.basename(LOCAL_MODEL_PATH.rstrip("\\/"))
+WORKER_SCRIPT = os.path.join(_HERE, "llm_worker.py")
+LOAD_TIMEOUT_SECONDS = 600
+GENERATE_TIMEOUT_SECONDS = 900
 
-_MODEL = None
-_TOKENIZER = None
-_IS_LOADED = False
-_LOAD_ERROR = None
+SYSTEM_PROMPT = (
+    "You are NovusPipeline, an autonomous code modernization AI. Refactor the legacy code to "
+    "comply with the guidelines (modern libraries, explicit type hints, no bare except, secure "
+    "APIs) while strictly preserving its behavior. Never rename or remove functions, classes or "
+    "variables that other modules depend on. Reply with the complete modernized file in a single "
+    "```python code block, then at most three short bullet points describing the changes."
+)
 
 
-def get_model_info() -> Dict[str, Any]:
-    """Returns metadata and status information about the configured local LLM."""
-    exists = os.path.exists(LOCAL_MODEL_PATH)
-    config_path = os.path.join(LOCAL_MODEL_PATH, "adapter_config.json")
-    has_config = os.path.exists(config_path)
+def llm_python() -> Optional[str]:
+    """Interpreter for the worker: NOVUS_LLM_PYTHON, else the repo's .venv-llm, else None."""
+    if os.environ.get("NOVUS_LLM_PYTHON"):
+        return os.environ["NOVUS_LLM_PYTHON"]
+    for rel in ((".venv-llm", "Scripts", "python.exe"), (".venv-llm", "bin", "python")):
+        candidate = os.path.join(_HERE, *rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return None
 
-    return {
+
+class LLMWorker:
+    """One persistent worker process; thread-safe; restarted if it dies, killed if it hangs."""
+
+    def __init__(self) -> None:
+        self._proc: Optional[subprocess.Popen] = None
+        self._lines: "queue.Queue[str]" = queue.Queue()
+        self._lock = threading.Lock()
+        self._next_id = 0
+
+    def _start(self) -> None:
+        python = llm_python()
+        if python is None:
+            raise RuntimeError("No LLM interpreter: create .venv-llm (see README) or set NOVUS_LLM_PYTHON.")
+        env = dict(os.environ, NOVUS_LLM_PATH=LOCAL_MODEL_PATH, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env)
+        self._lines = queue.Queue()
+        threading.Thread(target=self._pump, args=(self._proc, self._lines), daemon=True).start()
+
+    @staticmethod
+    def _pump(proc: subprocess.Popen, lines: "queue.Queue[str]") -> None:
+        for line in proc.stdout:
+            lines.put(line)
+        lines.put("")  # EOF marker: worker exited
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    def request(self, op: str, timeout: float, **payload: Any) -> Dict[str, Any]:
+        with self._lock:
+            if not self.running:
+                self._start()
+            self._next_id += 1
+            req_id = self._next_id
+            self._proc.stdin.write(json.dumps({"id": req_id, "op": op, **payload}) + "\n")
+            self._proc.stdin.flush()
+            while True:
+                try:
+                    line = self._lines.get(timeout=timeout)
+                except queue.Empty:
+                    self.stop()
+                    raise TimeoutError(f"LLM worker did not answer '{op}' within {timeout:.0f}s (worker restarted).")
+                if line == "":
+                    self._proc = None
+                    raise RuntimeError("LLM worker exited unexpectedly (out of memory?).")
+                resp = json.loads(line)
+                if resp.get("id") == req_id:
+                    return resp
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+            self._proc = None
+
+
+_WORKER = LLMWorker()
+
+
+def get_model_info(probe: bool = False) -> Dict[str, Any]:
+    """Static adapter info; with `probe`, starts the worker and loads the model to report device/VRAM."""
+    info: Dict[str, Any] = {
         "model_path": LOCAL_MODEL_PATH,
-        "exists": exists,
-        "has_adapter_config": has_config,
-        "model_name": "unsloth_Qwen3.5-2B_1785882774",
+        "exists": os.path.exists(LOCAL_MODEL_PATH),
+        "has_adapter_config": os.path.exists(os.path.join(LOCAL_MODEL_PATH, "adapter_config.json")),
+        "model_name": MODEL_NAME,
         "base_model": "unsloth/Qwen3.5-2B",
-        "is_loaded_in_memory": _IS_LOADED,
-        "load_error": _LOAD_ERROR,
+        "worker_python": llm_python(),
+        "worker_running": _WORKER.running,
     }
-
-
-def load_local_tokenizer():
-    """Lazy loader for local tokenizer."""
-    global _TOKENIZER
-    if _TOKENIZER is None and os.path.exists(LOCAL_MODEL_PATH):
+    try:
+        with open(os.path.join(LOCAL_MODEL_PATH, "adapter_config.json"), "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        info.update(base_model=cfg.get("base_model_name_or_path", info["base_model"]),
+                    lora_rank=cfg.get("r"), lora_alpha=cfg.get("lora_alpha"),
+                    training_method=cfg.get("unsloth_training_method"))
+    except (OSError, ValueError):
+        pass
+    if probe:
         try:
-            from transformers import AutoTokenizer
-            _TOKENIZER = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True)
+            resp = _WORKER.request("load", LOAD_TIMEOUT_SECONDS)
+            info["worker"] = resp.get("status")
+            info["load_error"] = resp.get("error")
         except Exception as e:
-            logging.error(f"Failed to load local tokenizer from {LOCAL_MODEL_PATH}: {e}")
-    return _TOKENIZER
+            info["load_error"] = f"{type(e).__name__}: {e}"
+        info["worker_running"] = _WORKER.running
+    return info
+
+
+def generate_modernization_messages(legacy_code: str, rag_guidelines: str, codebase_context: str = "") -> List[Dict[str, str]]:
+    context_block = f"\nCodebase context (dependents, public API, smell locations):\n{codebase_context}\n" \
+        if codebase_context else ""
+    user = (f"Modernization guidelines:\n{rag_guidelines}\n{context_block}\n"
+            f"Legacy code to refactor:\n```python\n{legacy_code}\n```")
+    return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
 
 
 def generate_modernization_prompt(legacy_code: str, rag_guidelines: str, codebase_context: str = "") -> str:
-    """Formats code refactoring prompt for Qwen3.5-2B chat template."""
-    system_prompt = (
-        "You are NovusPipeline, an autonomous code modernization AI. "
-        "Your task is to refactor legacy code to comply with enterprise clean-code, "
-        "strict typing, and security guidelines while strictly preserving logical parity. "
-        "Never rename or remove symbols that other modules depend on."
-    )
+    """Plain-text rendering of the chat messages (the worker applies the real chat template)."""
+    return "\n\n".join(f"<|{m['role']}|>\n{m['content']}"
+                       for m in generate_modernization_messages(legacy_code, rag_guidelines, codebase_context))
 
-    context_block = f"\nCodebase Context (dependents, public API, smell locations):\n{codebase_context}\n" \
-        if codebase_context else ""
-    user_content = f"""Modernization Guidelines:
-{rag_guidelines}
-{context_block}
-Legacy Code to Refactor:
-```code
-{legacy_code}
-```
 
-Provide the modernized code with explicit type annotations, updated libraries, and security fixes."""
-
-    tokenizer = load_local_tokenizer()
-    if tokenizer and hasattr(tokenizer, "apply_chat_template"):
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content}
-        ]
+def extract_code(text: str) -> Optional[str]:
+    """The model's code: the longest fenced block that parses, else the whole reply if it parses."""
+    import ast
+    blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.DOTALL)
+    for block in sorted(blocks, key=len, reverse=True) + [text]:
         try:
-            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        except Exception:
-            pass
-
-    return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
-
-
-def _load_local_model():
-    """Loads base model + LoRA adapter once per process (previously reloaded on every call)."""
-    global _MODEL, _IS_LOADED, _LOAD_ERROR
-    if _MODEL is not None:
-        return _MODEL
-    if _LOAD_ERROR is not None:
-        raise RuntimeError(_LOAD_ERROR)
-    try:
-        from peft import PeftConfig, PeftModel
-        from transformers import AutoModelForCausalLM
-        import torch
-
-        config = PeftConfig.from_pretrained(LOCAL_MODEL_PATH)
-        cuda = torch.cuda.is_available()
-        base_model = AutoModelForCausalLM.from_pretrained(
-            config.base_model_name_or_path,
-            dtype=torch.float16 if cuda else torch.float32,
-            device_map="auto" if cuda else None,
-            trust_remote_code=True,
-            local_files_only=True,
-        )
-        _MODEL = PeftModel.from_pretrained(base_model, LOCAL_MODEL_PATH)
-        _MODEL.eval()
-        _IS_LOADED = True
-        return _MODEL
-    except Exception as e:
-        _LOAD_ERROR = f"{type(e).__name__}: {e}"
-        raise RuntimeError(_LOAD_ERROR)
+            ast.parse(block)
+            return block.rstrip() + "\n"
+        except (SyntaxError, ValueError):
+            continue
+    return None
 
 
-def _rule_based_proposal(legacy_code: str, label: str) -> str:
+def validate_proposal(original: str, proposed: Optional[str], required_names: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Gate for applying a proposal: parses, introduces no smells, keeps imported symbols."""
+    from modernizer import LegacySmellDetector, missing_names, top_level_names
+
+    if proposed is None:
+        return {"valid": False, "issues": ["No parseable Python code in the model output."]}
+    before = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(original, "x.py"))
+    after = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(proposed, "x.py"))
+    issues: List[str] = []
+    introduced = sorted(s for s in after if after[s] > before.get(s, 0))
+    if introduced:
+        issues.append(f"Introduces smells: {', '.join(introduced)}")
+    broken = missing_names(proposed, required_names or [])
+    if broken:
+        issues.append(f"Removes symbols other modules import: {', '.join(broken)}")
+    old_public = {n for n in (top_level_names(original) or set()) if not n.startswith("_")}
+    dropped = sorted(old_public - (top_level_names(proposed) or set()))
+    return {
+        "valid": not issues,
+        "issues": issues,
+        "warnings": [f"Drops public top-level names: {', '.join(dropped)}"] if dropped else [],
+        "smells_before": dict(before), "smells_after": dict(after),
+        "resolved": sorted(s for s in before if after.get(s, 0) < before[s]),
+    }
+
+
+def _max_new_tokens(code: str) -> int:
+    # A rewrite is about as long as its input (~3.5 chars/token for code), plus room for notes.
+    return max(256, min(4096, int(len(code) / 3.5 * 1.3) + 192))
+
+
+def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_context: str = "",
+                          required_names: Optional[List[str]] = None, adapter: bool = True) -> Dict[str, Any]:
+    """
+    Structured LLM proposal: {"engine", "code", "raw", "validation", "stats", "error"}.
+    Falls back to the rule-based modernizer when no worker is available.
+    """
     from modernizer import CodeModernizer
-    mod_code, changes = CodeModernizer.modernize_python(legacy_code)
-    summary = "\n".join(f"- {c}" for c in changes) or "- No applicable automated transformations."
-    return f"```python\n{mod_code}\n```\n\n### {label}\n{summary}"
 
+    def rule_based(reason: str) -> Dict[str, Any]:
+        code, changes = CodeModernizer.modernize_python(legacy_code)
+        return {"engine": "rule-based", "code": code, "raw": "\n".join(f"- {c}" for c in changes),
+                "validation": validate_proposal(legacy_code, code, required_names), "stats": {}, "error": reason}
 
-def generate_llm_modernization(legacy_code: str, rag_guidelines: str, max_new_tokens: int = 512,
-                               codebase_context: str = "") -> str:
-    """
-    Generates modernized code using the local Unsloth Qwen 3.5 2B model if available,
-    with automatic fallback to rule-based modernization.
-    """
     if os.environ.get("NOVUS_FAST_TEST") == "1":
-        return _rule_based_proposal(
-            legacy_code, "Proposed Modernizations (`unsloth_Qwen3.5-2B_1785882774` - Fast Engine)")
-
+        return rule_based("NOVUS_FAST_TEST=1")
     try:
-        model = _load_local_model()
-        import torch
-
-        tokenizer = load_local_tokenizer()
-        if tokenizer is None:
-            raise RuntimeError("tokenizer unavailable")
-        prompt = generate_modernization_prompt(legacy_code, rag_guidelines, codebase_context)
-        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            # Greedy decoding: deterministic output for a parity-sensitive task.
-            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
-        return tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
+        resp = _WORKER.request("generate", GENERATE_TIMEOUT_SECONDS + LOAD_TIMEOUT_SECONDS,
+                               messages=generate_modernization_messages(legacy_code, rag_guidelines, codebase_context),
+                               max_new_tokens=_max_new_tokens(legacy_code), adapter=adapter)
     except Exception as e:
-        logging.warning(f"Local LLM inference fallback triggered: {e}")
-        return _rule_based_proposal(legacy_code, "Applied Modernizations (Rule-based Fallback)")
+        logging.warning(f"Local LLM unavailable, using rule-based fallback: {e}")
+        return rule_based(f"{type(e).__name__}: {e}")
+    if not resp.get("ok"):
+        return rule_based(resp.get("error", "worker error"))
+    code = extract_code(resp["text"])
+    return {"engine": f"{MODEL_NAME}{'' if adapter else ' (adapter disabled)'}", "code": code, "raw": resp["text"],
+            "validation": validate_proposal(legacy_code, code, required_names), "stats": resp.get("stats", {}),
+            "error": None}

@@ -14,14 +14,18 @@ logging.root.addHandler(stderr_handler)
 os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
 os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
 
+import functools
 import re
 import shlex
 import subprocess
+import threading
 from collections import Counter
 from typing import List, Optional, Tuple
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
 
-from modernizer import LegacySmellDetector, CodeModernizer
+from modernizer import LegacySmellDetector, CodeModernizer, missing_names
 import codebase_context
 import local_llm
 import gnn_model
@@ -33,6 +37,39 @@ from reporter import ModernizationReporter
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP("NovusPipeline")
+
+# Tools that modify the workspace (files, git, test runs) are serialized: they run in
+# worker threads, and two concurrent pipeline runs must never interleave git operations.
+_WORKSPACE_LOCK = threading.RLock()
+_TOOL_KINDS = {
+    "read": dict(read_only_hint=True, destructive_hint=False, idempotent_hint=True),
+    "write": dict(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
+    "destructive": dict(read_only_hint=False, destructive_hint=True, idempotent_hint=False),
+}
+
+
+def _tool(kind: str, timeout: float = 900.0):
+    """
+    Registers a tool with MCP annotations, a timeout, and thread execution. Results starting
+    with "Error" are raised as ToolError so clients see isError=True. The undecorated function
+    is returned unchanged, so tools can call each other and tests can call them directly.
+    """
+    def register(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            if kind == "read":
+                result = fn(*args, **kwargs)
+            else:
+                with _WORKSPACE_LOCK:
+                    result = fn(*args, **kwargs)
+            if isinstance(result, str) and result.startswith("Error"):
+                raise ToolError(result)
+            return result
+
+        mcp.tool(wrapper, name=fn.__name__, timeout=timeout, run_in_thread=True,
+                 annotations=ToolAnnotations(open_world_hint=False, **_TOOL_KINDS[kind]))
+        return fn
+    return register
 
 # The codebase being modernized. Defaults to the server's working directory;
 # set NOVUS_WORKSPACE_ROOT to point the server at another project.
@@ -91,7 +128,7 @@ def expand_query(query: str) -> str:
 # Core Tools (Phase 1 & Phase 2+)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool("read")
 def read_legacy_file(file_path: str) -> str:
     """
     Accepts a file path string; returns raw legacy code string.
@@ -120,7 +157,7 @@ def read_legacy_file(file_path: str) -> str:
         return f"Error reading file '{file_path}': {str(e)}"
 
 
-@mcp.tool()
+@_tool("read")
 def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> str:
     """
     Query the RAG vector database for modernization and clean-code guidelines.
@@ -186,7 +223,7 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
         return f"Error querying RAG guidelines: {str(e)}"
 
 
-@mcp.tool()
+@_tool("read")
 def search_rag_by_id(document_id: str) -> str:
     """
     Retrieve a specific modernization guideline document directly by its ID.
@@ -219,7 +256,7 @@ def search_rag_by_id(document_id: str) -> str:
         return f"Error searching RAG document by ID '{document_id}': {str(e)}"
 
 
-@mcp.tool()
+@_tool("read")
 def get_rag_stats() -> str:
     """
     Returns diagnostic statistics and status overview of the local RAG vector database.
@@ -253,7 +290,7 @@ def get_rag_stats() -> str:
         return f"Error fetching RAG stats: {str(e)}"
 
 
-@mcp.tool()
+@_tool("write")
 def ingest_rag_document(document_id: str, title: str, category: str, content: str) -> str:
     """
     Dynamically ingest a custom document into the RAG vector database.
@@ -289,7 +326,7 @@ def ingest_rag_document(document_id: str, title: str, category: str, content: st
         return f"Error ingesting document into RAG: {str(e)}"
 
 
-@mcp.tool()
+@_tool("destructive")
 def reset_rag_database() -> str:
     """
     Programmatically resets and re-seeds the local RAG database with core enterprise guidelines.
@@ -404,7 +441,7 @@ def _execute_test_command(command: str) -> Tuple[Optional[int], str]:
     return res.returncode, _truncate("\n".join(output))
 
 
-@mcp.tool()
+@_tool("write")
 def run_local_tests(command: str) -> str:
     """
     Runs a test-suite command inside the workspace and returns its console output
@@ -420,7 +457,7 @@ def _pr_metadata_path(branch_name: str) -> str:
     return os.path.join(WORKSPACE_ROOT, f".novus_pr_{re.sub(r'[^A-Za-z0-9._-]', '_', branch_name)}.md")
 
 
-@mcp.tool()
+@_tool("destructive")
 def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str, pr_description: str,
                             files: Optional[List[str]] = None) -> str:
     """
@@ -500,23 +537,45 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
 # Phase 3 & Local LLM Integration Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-def get_local_llm_status() -> str:
+@_tool("read", timeout=900)
+def get_local_llm_status(probe: bool = False) -> str:
     """
-    Returns the status and metadata for the integrated fine-tuned local model:
-    Path: C:\\Users\\Hp\\.unsloth\\studio\\outputs\\unsloth_Qwen3.5-2B_1785882774
+    Status of the fine-tuned local LLM (LoRA adapter on unsloth/Qwen3.5-2B), served by a
+    separate worker process. With `probe`, starts the worker and loads the model (can take a
+    minute) to report the real device, load time and VRAM use.
+
+    Args:
+        probe: Load the model now instead of only reporting configuration.
     """
     try:
-        info = local_llm.get_model_info()
-        status_str = "Operational (Configured)" if info["exists"] else "Path Not Found"
-        return (
-            f"## Integrated Local LLM Status\n\n"
-            f"- **Model Path**: `{info['model_path']}`\n"
-            f"- **Model Name**: `{info['model_name']}`\n"
-            f"- **Base Model**: `{info['base_model']}`\n"
-            f"- **Adapter Config Found**: {info['has_adapter_config']}\n"
-            f"- **Status**: {status_str}"
-        )
+        info = local_llm.get_model_info(probe=probe)
+        if not info["exists"]:
+            status_str = "Adapter path not found"
+        elif info.get("load_error"):
+            status_str = f"Load failed: {info['load_error']}"
+        elif probe:
+            status_str = "Loaded and ready"
+        elif info["worker_python"] is None:
+            status_str = "Configured, but no LLM interpreter (.venv-llm / NOVUS_LLM_PYTHON); rule-based fallback in use"
+        else:
+            status_str = "Configured (loads on first use; call with probe=true to verify)"
+        lines = [
+            "## Integrated Local LLM Status\n",
+            f"- **Model Path**: `{info['model_path']}`",
+            f"- **Model Name**: `{info['model_name']}`",
+            f"- **Base Model**: `{info['base_model']}`",
+            f"- **Adapter Config Found**: {info['has_adapter_config']}"
+            + (f" (LoRA r={info.get('lora_rank')}, alpha={info.get('lora_alpha')}, {info.get('training_method')})"
+               if info.get("lora_rank") else ""),
+            f"- **Worker Interpreter**: `{info['worker_python']}`",
+            f"- **Status**: {status_str}",
+        ]
+        worker = info.get("worker") or {}
+        if worker.get("loaded"):
+            lines.append(f"- **Runtime**: `{worker.get('model_class')}` on {worker.get('device')} "
+                         f"({worker.get('gpu', 'CPU')}), loaded in {worker.get('load_seconds')}s, "
+                         f"{worker.get('vram_allocated_gb', 0)} GB VRAM")
+        return "\n".join(lines)
     except Exception as e:
         return f"Error getting local LLM status: {str(e)}"
 
@@ -533,38 +592,12 @@ def _codebase_context(file_path: str) -> Tuple[Optional[dict], str]:
         return None, f"{type(e).__name__}: {e}"
 
 
-def _top_level_names(code: str) -> Optional[set]:
-    """Names a module defines or imports at top level (what `from mod import x` can see)."""
-    import ast
-    try:
-        tree = ast.parse(code)
-    except (SyntaxError, ValueError, RecursionError):
-        return None
-    names = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            names.add(node.name)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name).split(".")[0] for a in node.names)
-        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for t in targets:
-                names.update(n.id for n in ast.walk(t) if isinstance(n, ast.Name))
-        else:  # e.g. names defined under `if`/`try` at module level
-            names.update(n.name for n in ast.walk(node) if isinstance(n, (ast.FunctionDef, ast.ClassDef)))
-            names.update(n.id for n in ast.walk(node) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store))
-    return names
-
-
 def _broken_api(new_code: str, api_surface: List[str]) -> List[str]:
     """Symbols other modules import from this file that `new_code` no longer provides."""
-    names = _top_level_names(new_code)
-    if names is None or "*" in names:
-        return []
-    return sorted(n for n in api_surface if n not in names)
+    return missing_names(new_code, api_surface)
 
 
-@mcp.tool()
+@_tool("read", timeout=1800)
 def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> str:
     """
     Generates a modernized code proposal for a legacy file using the integrated fine-tuned
@@ -588,20 +621,34 @@ def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> 
 
         ctx, _ = _codebase_context(file_path)
         context_md = codebase_context.format_file_context(ctx) if ctx else ""
-        proposal = local_llm.generate_llm_modernization(code, rag_guidelines, codebase_context=context_md)
+        p = local_llm.propose_modernization(code, rag_guidelines, context_md,
+                                            required_names=ctx["api_surface"] if ctx else [])
+        v = p["validation"]
+        verdict = ("✅ Passes validation (parses, no new smells, imported symbols kept)" if v["valid"]
+                   else "❌ Rejected: " + "; ".join(v["issues"]))
+        details = [f"- **Engine**: `{p['engine']}`" + (f" (fallback reason: {p['error']})" if p["error"] else ""),
+                   f"- **Validation**: {verdict}",
+                   f"- **Smells resolved**: {', '.join(v.get('resolved', [])) or 'none'}"]
+        details += [f"- ⚠️ {w}" for w in v.get("warnings", [])]
+        if p["stats"]:
+            s = p["stats"]
+            details.append(f"- **Generation**: {s.get('new_tokens')} tokens in {s.get('seconds')}s "
+                           f"({s.get('tokens_per_second')} tok/s)")
 
         return (
             f"## LLM Modernization Proposal for `{file_path}`\n"
             f"**Model**: `unsloth_Qwen3.5-2B_1785882774`\n\n"
             f"### Retrieved Guidelines\n{rag_guidelines}\n\n"
             + (f"{context_md}\n\n" if context_md else "")
-            + f"### Proposed Refactoring\n{proposal}"
+            + "### Proposal\n" + "\n".join(details) + "\n\n"
+            + f"```python\n{p['code'] or ''}```\n\n"
+            + (f"### Model Notes\n{p['raw']}" if p["engine"] == "rule-based" else "")
         )
     except Exception as e:
         return f"Error generating LLM modernization proposal for '{file_path}': {str(e)}"
 
 
-@mcp.tool()
+@_tool("read")
 def analyze_legacy_codebase(file_path: str) -> str:
     """
     Audits a file for legacy code smells, cross-references RAG guidelines, cross-checks
@@ -668,7 +715,7 @@ def analyze_legacy_codebase(file_path: str) -> str:
         return f"Error analyzing legacy codebase for '{file_path}': {str(e)}"
 
 
-@mcp.tool()
+@_tool("destructive")
 def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
     """
     Phase 3 Tool: Applies modernization changes to a file safely. Creates a backup snapshot (.bak)
@@ -755,11 +802,12 @@ def _restore(full_path: str) -> str:
     return "Backup snapshot file not found for rollback."
 
 
-@mcp.tool()
+@_tool("destructive", timeout=3600)
 def run_autonomous_modernization_pipeline(
     file_path: str,
     test_command: str = "",
-    branch_name: str = "auto-modernization-branch"
+    branch_name: str = "auto-modernization-branch",
+    use_llm: bool = False,
 ) -> str:
     """
     Executes the complete, codebase-aware autonomous refactoring loop:
@@ -775,6 +823,9 @@ def run_autonomous_modernization_pipeline(
         file_path:    Target legacy file to modernize.
         test_command: Optional test command; empty selects related tests automatically.
         branch_name:  Target Git branch for PR creation (default 'auto-modernization-branch').
+        use_llm:      Try the fine-tuned local LLM first. Its proposal is applied only if it
+                      passes validation (parses, no new smells, imported symbols kept);
+                      otherwise the rule engine is used. Tests gate both.
     """
     full_path = _resolve_workspace_path(file_path)
     if not is_path_in_workspace(full_path):
@@ -784,7 +835,26 @@ def run_autonomous_modernization_pipeline(
         ctx, _ = _codebase_context(file_path)
         audit_res = analyze_legacy_codebase(file_path)
 
-        mod_res = apply_code_modernization(file_path)
+        engine_note = "Engine: rule-based modernizer."
+        llm_code = None
+        if use_llm and full_path.endswith(".py"):
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                original = f.read()
+            smells = sorted({x["smell_id"] for x in LegacySmellDetector.scan_code(original, file_path)})
+            rag = query_rag_guidelines(" ".join(LegacySmellDetector._BY_ID[s]["rag_query"] for s in smells[:3])
+                                       or "modernize legacy python", n_results=2)
+            p = local_llm.propose_modernization(original, rag,
+                                                codebase_context.format_file_context(ctx) if ctx else "",
+                                                required_names=ctx["api_surface"] if ctx else [])
+            if p["engine"] != "rule-based" and p["validation"]["valid"] and p["code"] and p["code"] != original:
+                llm_code = p["code"]
+                engine_note = (f"Engine: `{p['engine']}` (validated; resolved "
+                               f"{', '.join(p['validation']['resolved']) or 'no rule-engine smells'}).")
+            else:
+                reason = p["error"] or "; ".join(p["validation"]["issues"]) or "no change proposed"
+                engine_note = f"Engine: rule-based modernizer (LLM proposal not used: {reason})."
+
+        mod_res = apply_code_modernization(file_path, modernized_code=llm_code or "")
         if mod_res.startswith("Error"):
             return f"Pipeline Aborted during modernization phase:\n{mod_res}"
         if mod_res.startswith("No applicable"):
@@ -811,7 +881,7 @@ def run_autonomous_modernization_pipeline(
             branch_name=branch_name,
             commit_message=f"refactor: autonomous modernization of {os.path.basename(file_path)}",
             pr_title=f"Autonomous Modernization: {os.path.basename(file_path)}",
-            pr_description=(f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{mod_res}\n\n"
+            pr_description=(f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{engine_note}\n{mod_res}\n\n"
                             f"### Test Verification\nPassed (exit code 0): `{command}`\n\n### Impact\n{impact}"),
             files=[file_path],
         )
@@ -823,7 +893,7 @@ def run_autonomous_modernization_pipeline(
         return (
             f"🎉 Autonomous Modernization Pipeline Completed Successfully!\n\n"
             f"1. Audit Findings & RAG Match:\n{audit_res[:300]}...\n\n"
-            f"2. Transformations Applied:\n{mod_res}\n\n"
+            f"2. Transformations Applied ({engine_note}):\n{mod_res}\n\n"
             f"3. Verification (`{command}`):\n{test_res}\n\n"
             f"4. Git Status:\n{pr_res}{follow_up_md}"
         )
@@ -836,7 +906,7 @@ def run_autonomous_modernization_pipeline(
 # Phase 4: Git PR & Modernization Reporting Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool("write", timeout=1800)
 def format_modernization_report(
     file_path: str,
     branch_name: str = "auto-modernization-branch",
@@ -879,7 +949,7 @@ def format_modernization_report(
         return f"Error formatting modernization report for '{file_path}': {str(e)}"
 
 
-@mcp.tool()
+@_tool("destructive")
 def finalize_git_migration_pr(
     branch_name: str = "auto-modernization-branch",
     base_branch: str = "main",
@@ -932,7 +1002,7 @@ def finalize_git_migration_pr(
 # Phase 5: GNN Structural Code-Smell Classifier
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool("read")
 def get_gnn_model_status() -> str:
     """
     Phase 5 Tool: Returns status/metadata for the trained Graph Neural Network
@@ -966,7 +1036,7 @@ def get_gnn_model_status() -> str:
         return f"Error getting GNN model status: {str(e)}"
 
 
-@mcp.tool()
+@_tool("read")
 def analyze_code_structure_gnn(file_path: str) -> str:
     """
     Phase 5 Tool: Runs the trained Graph Neural Network over a Python file's AST
@@ -1012,7 +1082,7 @@ def analyze_code_structure_gnn(file_path: str) -> str:
 # Phase 6: Codebase Context (GNN + import graph)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
+@_tool("write")
 def index_codebase(force_rebuild: bool = False) -> str:
     """
     Builds or incrementally refreshes the codebase context index: every Python file's
@@ -1039,7 +1109,7 @@ def index_codebase(force_rebuild: bool = False) -> str:
         return f"Error indexing codebase: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@_tool("read")
 def get_codebase_overview(top_n: int = 10) -> str:
     """
     Codebase-wide modernization overview: files ranked by smell risk (rule engine + GNN,
@@ -1091,7 +1161,7 @@ def get_codebase_overview(top_n: int = 10) -> str:
         return f"Error building codebase overview: {type(e).__name__}: {e}"
 
 
-@mcp.tool()
+@_tool("read")
 def get_file_context(file_path: str) -> str:
     """
     Everything the codebase knows about one Python file: which modules import it and which of
@@ -1110,7 +1180,7 @@ def get_file_context(file_path: str) -> str:
     return codebase_context.format_file_context(ctx, limit=25)
 
 
-@mcp.tool()
+@_tool("read")
 def find_similar_code(file_path: str, function_name: str = "", n_results: int = 5) -> str:
     """
     Finds structurally similar code elsewhere in the codebase using GNN graph embeddings:
@@ -1150,6 +1220,25 @@ def find_similar_code(file_path: str, function_name: str = "", n_results: int = 
         return "\n".join(lines)
     except Exception as e:
         return f"Error finding similar code: {type(e).__name__}: {e}"
+
+
+@mcp.prompt()
+def modernization_workflow(file_path: str = "") -> str:
+    """Step-by-step, codebase-aware modernization workflow for an agent using these tools."""
+    target = f"`{file_path}`" if file_path else "the highest-risk file"
+    return (
+        f"Modernize {target} in this codebase safely:\n"
+        "1. If no file is given, call `get_codebase_overview` and pick the top hotspot that is not a test.\n"
+        "2. Call `get_file_context` to see its dependents, the public API they use (must not change), "
+        "related tests, and which functions hold the smells.\n"
+        "3. Call `analyze_legacy_codebase` for the rule-engine findings and matching guidelines.\n"
+        "4. Optionally call `generate_llm_modernization_proposal`; only proposals marked "
+        "'Passes validation' are safe to apply.\n"
+        "5. Call `run_autonomous_modernization_pipeline` (set `use_llm` to try the LLM first). It runs the "
+        "related tests, rolls back on failure or API breakage, and commits only that file.\n"
+        "6. Review the follow-up candidates it lists and repeat for them; use `find_similar_code` to find "
+        "other copies of the same pattern."
+    )
 
 
 if __name__ == "__main__":

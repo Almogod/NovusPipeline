@@ -1,35 +1,40 @@
 """
-eval_gnn.py — NovusPipeline Phase 5: GNN Stress-Test & Evaluation Harness
+eval_gnn.py — NovusPipeline: GNN Stress-Test & Evaluation Harness
 
-Evaluates the trained SmellGNN beyond its own validation split:
-  1. In-distribution   fresh template corpus (unseen seed), precision/recall/F1
+Evaluates the trained SmellGNN (single model or ensemble) beyond its own splits:
+  1. In-distribution   fresh template corpus (unseen seed)
   2. Contrast suite    smelly snippet vs. structurally-identical clean lookalike
-  3. Real code (OOD)   installed third-party packages (never trained on) and
-                       this repository's own Python files, teacher-labeled
-  4. Needle-in-haystack one smell injected into increasingly large clean files
-  5. Scale/robustness  latency vs. graph size, deep nesting, long expressions
+  3. Real code (OOD)   held-out third-party packages (never trained on: whole
+                       packages are assigned to the test split), file- and
+                       function-level, with bootstrap 95% confidence intervals;
+                       plus this repository's own files
+  4. Invariance        meaning-preserving rewrites (rename parameters, reorder
+                       definitions, add docstrings) must not change predictions
+  5. Needle-in-haystack one smell injected into increasingly large clean files
+  6. Scale/robustness  latency vs. graph size, deep nesting, long expressions
 
-Ground truth everywhere is the training teacher (`train_gnn.teacher_labels`:
-`LegacySmellDetector` on source with strings/comments removed), so these
-numbers measure how faithfully the GNN reproduces the rule engine on inputs it
-was not trained on — not absolute smell-detection truth.
+Ground truth is the rule engine the GNN distills (`LegacySmellDetector`), so
+these numbers measure agreement with it on unseen code.
 
 Usage:
     python eval_gnn.py              # writes .gnn_model/eval_report.json
 """
 
+import ast
 import glob
 import json
 import os
+import random
 import sys
 import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import gnn_model
 import train_gnn
 from code_graph import build_graph_from_code
 
 LABELS = gnn_model.SMELL_LABELS
+BOOTSTRAP_ROUNDS = 1000
 
 
 def teacher_labels(code: str) -> Dict[str, int]:
@@ -40,6 +45,15 @@ def thresholds() -> Dict[str, float]:
     return gnn_model.get_thresholds()
 
 
+def predictions(codes: List[str]) -> List[Optional[Dict[str, int]]]:
+    """Thresholded ensemble predictions, batched; None where no graph could be built."""
+    th = thresholds()
+    out = []
+    for res in gnn_model.analyze_many(codes):
+        out.append(None if res is None else {l: int(res["probs"][l] > th[l]) for l in LABELS})
+    return out
+
+
 def prf(tp: int, fp: int, fn: int, negatives: int) -> Dict[str, float]:
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
@@ -48,25 +62,39 @@ def prf(tp: int, fp: int, fn: int, negatives: int) -> Dict[str, float]:
             "support": tp + fn, "false_positive_rate": round(fp / negatives, 3) if negatives else 0.0}
 
 
-def score(samples: List[Tuple[str, Dict[str, int]]]) -> Dict[str, Dict[str, float]]:
-    th = thresholds()
-    counts = {label: [0, 0, 0, 0] for label in LABELS}  # tp, fp, fn, negatives
-    for code, truth in samples:
-        probs = gnn_model.predict_smells(code)
-        for label in LABELS:
-            pred = probs[label] > th[label]
-            counts[label][3] += 0 if truth[label] else 1
-            if pred and truth[label]:
-                counts[label][0] += 1
-            elif pred and not truth[label]:
-                counts[label][1] += 1
-            elif not pred and truth[label]:
-                counts[label][2] += 1
-    result = {label: prf(*counts[label]) for label in LABELS}
+def _counts(pairs: List[Tuple[Dict[str, int], Dict[str, int]]], label: str) -> Tuple[int, int, int, int]:
+    tp = sum(1 for p, t in pairs if p[label] and t[label])
+    fp = sum(1 for p, t in pairs if p[label] and not t[label])
+    fn = sum(1 for p, t in pairs if not p[label] and t[label])
+    return tp, fp, fn, sum(1 for _, t in pairs if not t[label])
+
+
+def _macro(result: Dict) -> Optional[float]:
     # F1 is undefined for labels with no positives; those are judged by false_positive_rate.
     supported = [l for l in LABELS if result[l]["support"]]
-    result["macro_f1"] = round(sum(result[l]["f1"] for l in supported) / len(supported), 3) if supported else None
-    result["samples"] = len(samples)
+    return round(sum(result[l]["f1"] for l in supported) / len(supported), 3) if supported else None
+
+
+def score(samples: List[Tuple[str, Dict[str, int]]], bootstrap: bool = False) -> Dict:
+    preds = predictions([code for code, _ in samples])
+    pairs = [(p, t) for p, (_, t) in zip(preds, samples) if p is not None]
+    result: Dict = {label: prf(*_counts(pairs, label)) for label in LABELS}
+    result["macro_f1"] = _macro(result)
+    result["samples"] = len(pairs)
+    if bootstrap and pairs:
+        rng = random.Random(0)
+        stats: Dict[str, List[float]] = {l: [] for l in LABELS + ["macro_f1"]}
+        for _ in range(BOOTSTRAP_ROUNDS):
+            sample = [pairs[rng.randrange(len(pairs))] for _ in pairs]
+            r = {label: prf(*_counts(sample, label)) for label in LABELS}
+            for l in LABELS:
+                if r[l]["support"]:
+                    stats[l].append(r[l]["f1"])
+            m = _macro(r)
+            if m is not None:
+                stats["macro_f1"].append(m)
+        result["ci95_f1"] = {k: [round(sorted(v)[int(0.025 * len(v))], 3), round(sorted(v)[int(0.975 * len(v)) - 1], 3)]
+                             for k, v in stats.items() if len(v) >= 20}
     return result
 
 
@@ -134,27 +162,92 @@ def eval_contrast() -> Dict:
 #    plus this repository's own Python files
 # ---------------------------------------------------------------------------
 
-def eval_external_code(n: int = 500) -> Dict:
-    import sysconfig
-
-    corpus = train_gnn.real_code_corpus(sysconfig.get_paths()["purelib"], n, seed=2024)
-    return score([(code, dict(zip(LABELS, map(int, label)))) for code, label, _ in corpus])
+_EXTERNAL_CACHE: Dict[str, list] = {}
 
 
-def eval_external_functions(max_functions: int = 1500) -> Dict:
-    """Per-function agreement on third-party code: what the codebase index's localization relies on."""
-    import ast
-    import sysconfig
+def external_chunks(chunks_per_package: int = 40) -> List[str]:
+    """Raw (unaugmented) chunks from the held-out test packages, cached for the run."""
+    if "chunks" not in _EXTERNAL_CACHE:
+        _EXTERNAL_CACHE["chunks"] = [c for c, _, _ in train_gnn.package_corpus("test", chunks_per_package, 2024, False, 0)]
+    return _EXTERNAL_CACHE["chunks"]
 
-    corpus = train_gnn.real_code_corpus(sysconfig.get_paths()["purelib"], 300, seed=2025)
+
+def eval_external_code() -> Dict:
+    report = score([(c, teacher_labels(c)) for c in external_chunks()], bootstrap=True)
+    report["packages"] = [p for p in train_gnn.list_packages(train_gnn.site_packages_root())
+                          if train_gnn.package_split(p) == "test"]
+    return report
+
+
+def eval_external_functions(max_functions: int = 3000) -> Dict:
+    """Per-function agreement on held-out packages: what the codebase index's localization relies on."""
     samples = []
-    for code, _, _ in corpus:
+    for code in external_chunks():
         for fn in train_gnn._function_nodes(ast.parse(code)):
             fn_code = ast.unparse(fn)
             samples.append((fn_code, teacher_labels(fn_code)))
             if len(samples) >= max_functions:
-                return score(samples)
-    return score(samples)
+                return score(samples, bootstrap=True)
+    return score(samples, bootstrap=True)
+
+
+class _RenameParameters(ast.NodeTransformer):
+    """Renames every function's parameters (and their uses inside it), except self/cls."""
+
+    def visit_FunctionDef(self, node):
+        a = node.args
+        params = [p for p in a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x]
+                  if p.arg not in ("self", "cls")]
+        mapping = {p.arg: f"p{i}_renamed" for i, p in enumerate(params)}
+        for p in params:
+            p.arg = mapping[p.arg]
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and sub.id in mapping:
+                sub.id = mapping[sub.id]
+        self.generic_visit(node)
+        return node
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
+def eval_invariance(max_samples: int = 400) -> Dict:
+    """Fraction of held-out chunks whose predicted smell set survives each meaning-preserving rewrite."""
+    rng = random.Random(7)
+    chunks = external_chunks()[:max_samples]
+
+    def rename(code: str) -> str:
+        return ast.unparse(_RenameParameters().visit(ast.parse(code)))
+
+    def reorder(code: str) -> str:
+        tree = ast.parse(code)
+        imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+        rest = [n for n in tree.body if not isinstance(n, (ast.Import, ast.ImportFrom))]
+        rng.shuffle(rest)
+        tree.body = imports + rest
+        return ast.unparse(tree)
+
+    def docstrings(code: str) -> str:
+        tree = ast.parse(code)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                node.body.insert(0, ast.Expr(ast.Constant("Added docstring: except: pickle.loads urllib2")))
+        return ast.unparse(tree)
+
+    base = predictions(chunks)
+    report = {}
+    for name, rewrite in (("rename_parameters", rename), ("reorder_definitions", reorder),
+                          ("add_docstrings", docstrings)):
+        rewritten = []
+        for code in chunks:
+            try:
+                rewritten.append(rewrite(code))
+            except (SyntaxError, ValueError, RecursionError):
+                rewritten.append(code)
+        after = predictions(rewritten)
+        valid = [(b, a) for b, a in zip(base, after) if b is not None and a is not None]
+        report[name] = round(sum(b == a for b, a in valid) / len(valid), 4) if valid else None
+    report["samples"] = len(chunks)
+    return report
 
 
 def eval_real_code() -> Dict:
@@ -248,6 +341,7 @@ def main() -> None:
         "contrast": eval_contrast(),
         "external_code": eval_external_code(),
         "external_functions": eval_external_functions(),
+        "invariance": eval_invariance(),
         "real_code": eval_real_code(),
         "needle": eval_needle(),
         "scale": eval_scale(),
