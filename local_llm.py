@@ -50,17 +50,20 @@ def load_local_tokenizer():
     return _TOKENIZER
 
 
-def generate_modernization_prompt(legacy_code: str, rag_guidelines: str) -> str:
+def generate_modernization_prompt(legacy_code: str, rag_guidelines: str, codebase_context: str = "") -> str:
     """Formats code refactoring prompt for Qwen3.5-2B chat template."""
     system_prompt = (
         "You are NovusPipeline, an autonomous code modernization AI. "
         "Your task is to refactor legacy code to comply with enterprise clean-code, "
-        "strict typing, and security guidelines while strictly preserving logical parity."
+        "strict typing, and security guidelines while strictly preserving logical parity. "
+        "Never rename or remove symbols that other modules depend on."
     )
 
+    context_block = f"\nCodebase Context (dependents, public API, smell locations):\n{codebase_context}\n" \
+        if codebase_context else ""
     user_content = f"""Modernization Guidelines:
 {rag_guidelines}
-
+{context_block}
 Legacy Code to Refactor:
 ```code
 {legacy_code}
@@ -82,58 +85,66 @@ Provide the modernized code with explicit type annotations, updated libraries, a
     return f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{user_content}<|im_end|>\n<|im_start|>assistant\n"
 
 
-def generate_llm_modernization(legacy_code: str, rag_guidelines: str, max_new_tokens: int = 512) -> str:
+def _load_local_model():
+    """Loads base model + LoRA adapter once per process (previously reloaded on every call)."""
+    global _MODEL, _IS_LOADED, _LOAD_ERROR
+    if _MODEL is not None:
+        return _MODEL
+    if _LOAD_ERROR is not None:
+        raise RuntimeError(_LOAD_ERROR)
+    try:
+        from peft import PeftConfig, PeftModel
+        from transformers import AutoModelForCausalLM
+        import torch
+
+        config = PeftConfig.from_pretrained(LOCAL_MODEL_PATH)
+        cuda = torch.cuda.is_available()
+        base_model = AutoModelForCausalLM.from_pretrained(
+            config.base_model_name_or_path,
+            dtype=torch.float16 if cuda else torch.float32,
+            device_map="auto" if cuda else None,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        _MODEL = PeftModel.from_pretrained(base_model, LOCAL_MODEL_PATH)
+        _MODEL.eval()
+        _IS_LOADED = True
+        return _MODEL
+    except Exception as e:
+        _LOAD_ERROR = f"{type(e).__name__}: {e}"
+        raise RuntimeError(_LOAD_ERROR)
+
+
+def _rule_based_proposal(legacy_code: str, label: str) -> str:
+    from modernizer import CodeModernizer
+    mod_code, changes = CodeModernizer.modernize_python(legacy_code)
+    summary = "\n".join(f"- {c}" for c in changes) or "- No applicable automated transformations."
+    return f"```python\n{mod_code}\n```\n\n### {label}\n{summary}"
+
+
+def generate_llm_modernization(legacy_code: str, rag_guidelines: str, max_new_tokens: int = 512,
+                               codebase_context: str = "") -> str:
     """
-    Generates modernized code using the local Unsloth Qwen 3.5 2B model if loaded/available,
+    Generates modernized code using the local Unsloth Qwen 3.5 2B model if available,
     with automatic fallback to rule-based modernization.
     """
     if os.environ.get("NOVUS_FAST_TEST") == "1":
-        from modernizer import CodeModernizer
-        mod_code, changes = CodeModernizer.modernize_python(legacy_code)
-        summary = "\n".join(f"- {c}" for c in changes)
-        return f"```python\n{mod_code}\n```\n\n### Proposed Modernizations (`unsloth_Qwen3.5-2B_1785882774` - Fast Engine)\n{summary}"
-
-    prompt = generate_modernization_prompt(legacy_code, rag_guidelines)
+        return _rule_based_proposal(
+            legacy_code, "Proposed Modernizations (`unsloth_Qwen3.5-2B_1785882774` - Fast Engine)")
 
     try:
-        from peft import PeftModel, PeftConfig
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model = _load_local_model()
         import torch
 
         tokenizer = load_local_tokenizer()
         if tokenizer is None:
-            tokenizer = AutoTokenizer.from_pretrained(LOCAL_MODEL_PATH, trust_remote_code=True)
-
-        config = PeftConfig.from_pretrained(LOCAL_MODEL_PATH)
-        base_model_name = config.base_model_name_or_path
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-
-        base_model = AutoModelForCausalLM.from_pretrained(
-            base_model_name,
-            torch_dtype=dtype,
-            device_map="auto" if torch.cuda.is_available() else None,
-            trust_remote_code=True,
-            local_files_only=True
-        )
-        model = PeftModel.from_pretrained(base_model, LOCAL_MODEL_PATH)
-
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+            raise RuntimeError("tokenizer unavailable")
+        prompt = generate_modernization_prompt(legacy_code, rag_guidelines, codebase_context)
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                temperature=0.2,
-                top_p=0.9,
-                do_sample=False
-            )
-
-        response = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        return response.strip()
+            # Greedy decoding: deterministic output for a parity-sensitive task.
+            outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=False)
+        return tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True).strip()
     except Exception as e:
         logging.warning(f"Local LLM inference fallback triggered: {e}")
-        from modernizer import CodeModernizer
-        mod_code, changes = CodeModernizer.modernize_python(legacy_code)
-        summary = "\n".join(f"- {c}" for c in changes)
-        return f"```python\n{mod_code}\n```\n\n### Applied Modernizations (Rule-based Fallback)\n{summary}"
+        return _rule_based_proposal(legacy_code, "Applied Modernizations (Rule-based Fallback)")

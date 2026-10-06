@@ -3,4 +3,6 @@ __pycache__/
 *.pyc
 .chroma_db/
 .gnn_model/
+.novus_index/
+*.bak
 .novus_pr_*.md

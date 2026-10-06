@@ -13,15 +13,20 @@ import os
 import hashlib
 import math
 import re
+import sys
 from collections import Counter
 
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
-WORKSPACE_ROOT = os.path.abspath(os.getcwd())
-CHROMA_DIR = os.path.join(WORKSPACE_ROOT, ".chroma_db")
+# The guideline store belongs to the tool, not to whichever codebase the server
+# is pointed at, so it lives next to this module.
+CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chroma_db")
 COLLECTION_NAME = "novus_guidelines"
 EMBEDDING_DIM = 256
+# Bump whenever tokenization/weighting changes: stored vectors built with a
+# different version are re-embedded on first use (see get_collection).
+EMBEDDING_VERSION = "tfidf_256_v2"
 
 _TECH_STOP_WORDS = {
     "the", "a", "an", "is", "it", "in", "of", "to", "and", "or", "for",
@@ -55,7 +60,8 @@ class TFIDFEmbeddingFunction(EmbeddingFunction):
         return "tfidf_256"
 
     def _tokenize(self, text: str) -> list[str]:
-        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text.lower())
+        # Split camelCase before lowercasing, otherwise the split can never match.
+        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text).lower()
         tokens = re.findall(r"[a-z0-9]+", text)
         return [t for t in tokens if len(t) > 1 and t not in _TECH_STOP_WORDS]
 
@@ -258,11 +264,56 @@ GUIDELINES = [
 
 
 def _safe_print(text: str) -> None:
-    """Print text safely on Windows terminals with limited encoding."""
+    """Progress output goes to stderr: under the MCP server, stdout is the JSON-RPC channel."""
     try:
-        print(text)
+        print(text, file=sys.stderr)
     except UnicodeEncodeError:
-        print(text.encode("ascii", errors="replace").decode("ascii"))
+        print(text.encode("ascii", errors="replace").decode("ascii"), file=sys.stderr)
+
+
+_CLIENTS: dict = {}
+
+
+def get_client():
+    if CHROMA_DIR not in _CLIENTS:
+        _CLIENTS[CHROMA_DIR] = chromadb.PersistentClient(path=CHROMA_DIR)
+    return _CLIENTS[CHROMA_DIR]
+
+
+def _collection_metadata() -> dict:
+    return {
+        "description": "NovusPipeline Enterprise Modernization Guidelines",
+        "embedding_dim": str(EMBEDDING_DIM),
+        "embedding_version": EMBEDDING_VERSION,
+    }
+
+
+def get_collection(create: bool = False):
+    """
+    The guideline collection, or None if it does not exist and `create` is False.
+    A collection embedded with a different EMBEDDING_VERSION is re-embedded in
+    place, keeping every document (including ones added via ingest_rag_document),
+    so stored and query vectors can never silently disagree.
+    """
+    client = get_client()
+    ef = TFIDFEmbeddingFunction()
+    try:
+        collection = client.get_collection(name=COLLECTION_NAME, embedding_function=ef)
+    except Exception:
+        if not create:
+            return None
+        return client.create_collection(name=COLLECTION_NAME, embedding_function=ef,
+                                        metadata=_collection_metadata())
+
+    if (collection.metadata or {}).get("embedding_version") != EMBEDDING_VERSION:
+        data = collection.get(include=["documents", "metadatas"])
+        client.delete_collection(COLLECTION_NAME)
+        collection = client.create_collection(name=COLLECTION_NAME, embedding_function=ef,
+                                              metadata=_collection_metadata())
+        if data["ids"]:
+            collection.upsert(ids=data["ids"], documents=data["documents"], metadatas=data["metadatas"])
+        _safe_print(f"[NovusPipeline RAG] Re-embedded {len(data['ids'])} documents with {EMBEDDING_VERSION}.")
+    return collection
 
 
 def seed_rag_database(reset: bool = True) -> None:
@@ -273,8 +324,7 @@ def seed_rag_database(reset: bool = True) -> None:
         reset: If True, drops and recreates the collection for a clean slate.
     """
     _safe_print(f"[NovusPipeline RAG] Initializing ChromaDB at: {CHROMA_DIR}")
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    ef = TFIDFEmbeddingFunction()
+    client = get_client()
 
     if reset:
         try:
@@ -283,15 +333,7 @@ def seed_rag_database(reset: bool = True) -> None:
         except Exception:
             pass
 
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=ef,
-        metadata={
-            "description": "NovusPipeline Enterprise Modernization Guidelines",
-            "version": "2.0",
-            "embedding_dim": str(EMBEDDING_DIM),
-        }
-    )
+    collection = get_collection(create=True)
 
     documents = [g["content"] for g in GUIDELINES]
     metadatas = [{"title": g["title"], "category": g["category"]} for g in GUIDELINES]
@@ -306,11 +348,17 @@ def seed_rag_database(reset: bool = True) -> None:
     _safe_print("[NovusPipeline RAG] Done. Run ingest_rag.py again to refresh.")
 
 
+def similarity_from_distance(distance: float) -> float:
+    """
+    Cosine similarity from ChromaDB's default distance, which is *squared* L2.
+    Embeddings are unit vectors, so ||a - b||^2 = 2 - 2cos(a, b).
+    """
+    return max(0.0, 1.0 - distance / 2.0)
+
+
 def verify_retrieval(query: str = "async python blocking io", n: int = 3) -> None:
     """Quick sanity check - query the freshly seeded collection."""
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    ef = TFIDFEmbeddingFunction()
-    col = client.get_collection(COLLECTION_NAME, embedding_function=ef)
+    col = get_collection()
     results = col.query(query_texts=[query], n_results=n, include=["documents", "metadatas", "distances"])
     _safe_print(f"\n[NovusPipeline RAG] Retrieval check (query='{query}'):")
     for i, (doc, meta, dist) in enumerate(zip(
@@ -318,7 +366,7 @@ def verify_retrieval(query: str = "async python blocking io", n: int = 3) -> Non
         results["metadatas"][0],
         results["distances"][0]
     ), 1):
-        score = round(1.0 - dist, 3) if dist is not None else "N/A"
+        score = round(similarity_from_distance(dist), 3) if dist is not None else "N/A"
         preview = doc[:120].encode("ascii", errors="replace").decode("ascii")
         _safe_print(f"\n  [{i}] {meta['title']} (category={meta['category']}, score={score})")
         _safe_print(f"      {preview}...")

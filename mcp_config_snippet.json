@@ -6,7 +6,8 @@
         "C:\\Users\\Hp\\Downloads\\NovusPipeline\\server.py"
       ],
       "env": {
-        "PYTHONUNBUFFERED": "1"
+        "PYTHONUNBUFFERED": "1",
+        "NOVUS_WORKSPACE_ROOT": "C:\\Users\\Hp\\Downloads\\NovusPipeline"
       }
     }
   }
