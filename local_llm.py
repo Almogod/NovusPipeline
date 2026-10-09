@@ -17,7 +17,7 @@ import os
 import queue
 import re
 import subprocess
-import sys
+import tempfile
 import threading
 from collections import Counter
 from typing import Any, Dict, List, Optional
@@ -27,6 +27,8 @@ LOCAL_MODEL_PATH = os.environ.get(
     "NOVUS_LLM_PATH", r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774")
 MODEL_NAME = os.path.basename(LOCAL_MODEL_PATH.rstrip("\\/"))
 WORKER_SCRIPT = os.path.join(_HERE, "llm_worker.py")
+# Worker stderr (load progress, tracebacks) — kept for diagnosing load/OOM failures.
+WORKER_LOG = os.path.join(tempfile.gettempdir(), "novus_llm_worker.log")
 LOAD_TIMEOUT_SECONDS = 600
 GENERATE_TIMEOUT_SECONDS = 900
 
@@ -64,8 +66,9 @@ class LLMWorker:
         if python is None:
             raise RuntimeError("No LLM interpreter: create .venv-llm (see README) or set NOVUS_LLM_PYTHON.")
         env = dict(os.environ, NOVUS_LLM_PATH=LOCAL_MODEL_PATH, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-        self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL, text=True, encoding="utf-8", env=env)
+        with open(WORKER_LOG, "a", encoding="utf-8") as log:
+            self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                          stderr=log, text=True, encoding="utf-8", env=env)
         self._lines = queue.Queue()
         threading.Thread(target=self._pump, args=(self._proc, self._lines), daemon=True).start()
 
@@ -122,6 +125,7 @@ def get_model_info(probe: bool = False) -> Dict[str, Any]:
         "base_model": "unsloth/Qwen3.5-2B",
         "worker_python": llm_python(),
         "worker_running": _WORKER.running,
+        "worker_log": WORKER_LOG,
     }
     try:
         with open(os.path.join(LOCAL_MODEL_PATH, "adapter_config.json"), "r", encoding="utf-8") as f:

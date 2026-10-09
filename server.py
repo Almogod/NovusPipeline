@@ -567,7 +567,7 @@ def get_local_llm_status(probe: bool = False) -> str:
             f"- **Adapter Config Found**: {info['has_adapter_config']}"
             + (f" (LoRA r={info.get('lora_rank')}, alpha={info.get('lora_alpha')}, {info.get('training_method')})"
                if info.get("lora_rank") else ""),
-            f"- **Worker Interpreter**: `{info['worker_python']}`",
+            f"- **Worker Interpreter**: `{info['worker_python']}` (log: `{info['worker_log']}`)",
             f"- **Status**: {status_str}",
         ]
         worker = info.get("worker") or {}
