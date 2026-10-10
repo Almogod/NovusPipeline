@@ -632,6 +632,18 @@ class TestLlmWorkerProtocol(StubWorkerTestCase):
         self.assertFalse(p["validation"]["valid"])
         self.assertIn("to_int", " ".join(p["validation"]["issues"]))
 
+    def test_proposal_adding_hallucinated_code_is_rejected(self):
+        # Observed with the over-trained adapter: invented helpers plus a __main__ demo block.
+        self.reply("```python\nimport logging\nlogger = logging.getLogger(__name__)\n\n"
+                   "def to_int(s: str) -> int:\n    return int(s)\n\ndef parse_json(d: str) -> dict:\n    return {}\n\n"
+                   "if __name__ == '__main__':\n    print(to_int('1'))\n```")
+        p = local_llm.propose_modernization("def to_int(s):\n    return int(s)\n", "rules", required_names=["to_int"])
+        issues = " ".join(p["validation"]["issues"])
+        self.assertFalse(p["validation"]["valid"])
+        self.assertIn("parse_json", issues)
+        self.assertIn("__main__", issues)
+        self.assertNotIn("logger", issues)  # new module constants are fine
+
     def test_unavailable_worker_falls_back_to_rules(self):
         os.environ["NOVUS_LLM_PYTHON"] = os.path.join(tempfile.gettempdir(), "no-such-python.exe")
         p = local_llm.propose_modernization("try:\n    pass\nexcept:\n    pass\n", "rules")

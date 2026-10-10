@@ -42,9 +42,10 @@ SMELL_LABELS: List[str] = [
 
 @dataclass
 class GNNConfig:
+    # Defaults = winner of the multi-seed sweep (selected on validation real code only).
     conv: str = "sage"            # "gcn" | "sage" | "sage_max" | "gin"
-    num_layers: int = 3
-    hidden_dim: int = 64
+    num_layers: int = 4
+    hidden_dim: int = 128
     type_embed_dim: int = 32
     field_embed_dim: int = 16
     token_embed_dim: int = 32

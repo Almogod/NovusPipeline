@@ -81,8 +81,12 @@ def _parse(code: str) -> Optional[ast.AST]:
         return None
 
 
-def top_level_names(code: str) -> Optional[set]:
-    """Names a module defines or imports at top level (what `from mod import x` can see); None if unparseable."""
+def top_level_names(code: str, include_imports: bool = True) -> Optional[set]:
+    """
+    Names a module defines (and, with `include_imports`, imports) at top level — what
+    `from mod import x` can see. None if unparseable. Use include_imports=False for the
+    module's own definitions: dropping an obsolete `import urllib2` is not an API break.
+    """
     tree = _parse(code)
     if tree is None:
         return None
@@ -91,7 +95,8 @@ def top_level_names(code: str) -> Optional[set]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
-            names.update((a.asname or a.name).split(".")[0] for a in node.names)
+            if include_imports:
+                names.update((a.asname or a.name).split(".")[0] for a in node.names)
         elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for t in targets:

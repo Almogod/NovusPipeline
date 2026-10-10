@@ -1,0 +1,14 @@
+# Optional environment for the local LLM worker (llm_worker.py) and GPU GNN training.
+# Kept separate from requirements.txt so the MCP server stays CPU-only and light.
+#
+#   python -m venv .venv-llm
+#   .venv-llm\Scripts\pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cu130
+#   .venv-llm\Scripts\pip install -r requirements-llm.txt
+#
+# The server finds .venv-llm automatically (or set NOVUS_LLM_PYTHON).
+
+transformers==5.18.0
+peft==0.21.2
+accelerate==1.15.0
+safetensors==0.8.0
+torch-geometric==2.8.0.post1

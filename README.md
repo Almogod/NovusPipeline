@@ -14,6 +14,8 @@ python train_gnn.py               # train the GNN smell classifier (~10 min on C
 python eval_gnn.py                # optional: stress-test report -> .gnn_model/eval_report.json
 ```
 
+Optional local LLM (needs an NVIDIA GPU with ~4 GB free VRAM): create `.venv-llm` as described in `requirements-llm.txt`. The server then starts `llm_worker.py` in that environment on first use. `NOVUS_LLM_PATH` points at the LoRA adapter; `NOVUS_LLM_ADAPTER=0` uses the base model only, which currently performs much better (see `phases.md`, Phase 7, and `python eval_llm.py`).
+
 Register the server with your MCP client using `mcp_config_snippet.json`. Set `NOVUS_WORKSPACE_ROOT` to the codebase you want to modernize (defaults to the server's working directory). `NOVUS_PYTHON` overrides the interpreter used to run tests; by default the workspace's own `.venv`/`venv` is used.
 
 ## Tools

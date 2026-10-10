@@ -25,11 +25,44 @@ ADAPTER_PATH = os.environ.get(
     "NOVUS_LLM_PATH", r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774")
 
 _state = {"model": None, "tokenizer": None, "device": None, "load_seconds": None, "load_error": None,
-          "base_model": None, "model_class": None}
+          "base_model": None, "model_class": None, "adapter_tensors": None, "adapter_verified": False,
+          "merged": False}
 
 
 def log(msg: str) -> None:
     print(f"[llm_worker] {msg}", file=sys.stderr, flush=True)
+
+
+def load_adapter_weights(model) -> str:
+    """
+    Loads the LoRA weights explicitly and verifies them. The adapter was trained on the
+    multimodal Qwen3_5ForConditionalGeneration, which names text layers
+    `model.language_model.layers.*`; the text-only model names them `model.layers.*`.
+    PEFT matches modules by regex (so LoRA layers are created) but then finds no weights
+    under the new names and silently leaves them at their zero init — the "fine-tuned"
+    model is then just the base model. Remap, load, and refuse to continue on any mismatch.
+    """
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    saved = load_file(os.path.join(ADAPTER_PATH, "adapter_model.safetensors"))
+    module_names = {n for n, _ in model.named_modules()}
+
+    def remap(key: str) -> str:
+        if ".language_model." in key:
+            candidate = key.replace(".language_model.", ".", 1)
+            if candidate.rsplit(".lora_", 1)[0] in module_names:
+                return candidate
+        return key
+
+    result = set_peft_model_state_dict(model, {remap(k): v for k, v in saved.items()})
+    unexpected = list(getattr(result, "unexpected_keys", []) or [])
+    if unexpected:
+        raise RuntimeError(f"{len(unexpected)} adapter tensors did not match the model, e.g. {unexpected[0]}")
+    zero_b = [n for n, p in model.named_parameters() if "lora_B" in n and float(p.detach().float().abs().sum()) == 0.0]
+    if zero_b:
+        raise RuntimeError(f"{len(zero_b)} LoRA B matrices are still zero after loading (adapter not applied)")
+    return f"{len(saved)}/{len(saved)}"
 
 
 def load() -> None:
@@ -50,13 +83,25 @@ def load() -> None:
         model_cls = getattr(transformers, "Qwen3_5ForCausalLM", None) or getattr(transformers, "AutoModelForImageTextToText")
         base = model_cls.from_pretrained(cfg.base_model_name_or_path, dtype=dtype,
                                          device_map="cuda" if cuda else None, local_files_only=True)
-        model = PeftModel.from_pretrained(base, ADAPTER_PATH)
+        if os.environ.get("NOVUS_LLM_ADAPTER", "1") == "0":
+            # Base model only: eval_llm.py showed the current adapter degrades code output.
+            model, adapter_tensors, merged = base, "disabled", True
+        else:
+            model = PeftModel.from_pretrained(base, ADAPTER_PATH)
+            adapter_tensors = load_adapter_weights(model)
+            # Merging folds LoRA into the base weights: no per-token adapter overhead, but
+            # adapter on/off comparisons (eval_llm.py) need it unmerged (NOVUS_LLM_MERGE=0).
+            merged = os.environ.get("NOVUS_LLM_MERGE", "1") == "1"
+            if merged:
+                model = model.merge_and_unload()
         model.eval()
         tokenizer = AutoTokenizer.from_pretrained(ADAPTER_PATH)
         _state.update(model=model, tokenizer=tokenizer, device=str(next(model.parameters()).device),
                       base_model=cfg.base_model_name_or_path, model_class=model_cls.__name__,
+                      adapter_tensors=adapter_tensors, adapter_verified=adapter_tensors != "disabled", merged=merged,
                       load_seconds=round(time.perf_counter() - start, 1))
-        log(f"loaded {model_cls.__name__} + adapter on {_state['device']} ({dtype}) in {_state['load_seconds']}s")
+        log(f"loaded {model_cls.__name__} + adapter ({adapter_tensors} tensors verified, merged={merged}) "
+            f"on {_state['device']} ({dtype}) in {_state['load_seconds']}s")
     except Exception as e:
         _state["load_error"] = f"{type(e).__name__}: {e}"
         log("load failed:\n" + traceback.format_exc())
@@ -85,6 +130,9 @@ def generate(messages: list, max_new_tokens: int = 512, adapter: bool = True) ->
     import torch
 
     model, tokenizer = _state["model"], _state["tokenizer"]
+    if not adapter and _state["merged"]:
+        raise RuntimeError("adapter is merged into the base weights; start the worker with NOVUS_LLM_MERGE=0 "
+                           "to compare against the base model")
     try:
         prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
                                                enable_thinking=False)

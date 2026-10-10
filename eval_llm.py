@@ -105,7 +105,7 @@ def score(case: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str, Any]:
     code = proposal["code"]
     before = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(case["code"], "x.py"))
     after = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(code, "x.py")) if code else before
-    public = {n for n in (top_level_names(case["code"]) or set()) if not n.startswith("_")}
+    public = {n for n in (top_level_names(case["code"], include_imports=False) or set()) if not n.startswith("_")}
     total = sum(before.values())
     return {
         "parses": code is not None,
@@ -121,6 +121,7 @@ def score(case: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str, Any]:
 
 def main() -> None:
     os.environ.pop("NOVUS_FAST_TEST", None)
+    os.environ["NOVUS_LLM_MERGE"] = "0"  # keep the adapter separable so it can be switched off for the A/B
     info = local_llm.get_model_info(probe=True)
     if info.get("load_error"):
         sys.exit(f"LLM worker could not load the model: {info['load_error']}")
@@ -128,7 +129,8 @@ def main() -> None:
 
     results: Dict[str, Any] = {"model": info, "cases": []}
     for case in CASES:
-        required = sorted(n for n in (top_level_names(case["code"]) or set()) if not n.startswith("_"))
+        required = sorted(n for n in (top_level_names(case["code"], include_imports=False) or set())
+                          if not n.startswith("_"))
         row: Dict[str, Any] = {"name": case["name"]}
         outputs = {}
         for engine, adapter in (("adapter", True), ("base", False)):

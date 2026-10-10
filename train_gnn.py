@@ -585,7 +585,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--no-tokens", action="store_true", help="ablation: drop identifier features")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dropout", type=float)
-    parser.add_argument("--lr", type=float, default=2e-3)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--ensemble", type=int, default=1, help="number of seed-ensemble members")
     parser.add_argument("--device", default="auto", help="auto | cpu | cuda")
     parser.add_argument("--samples", type=int, default=DATASET_DEFAULTS["num_samples"], help="synthetic template samples")
@@ -614,7 +614,7 @@ def main(argv: Optional[List[str]] = None) -> None:
               f"{statistics.mean(scores):.4f} +/- {std:.4f} {scores}")
         return
 
-    run_training(config, args.seed, ensemble=args.ensemble, **common)
+    run_training(config, args.seed, ensemble=args.ensemble, max_epochs=100, patience=12, **common)
 
 
 if __name__ == "__main__":

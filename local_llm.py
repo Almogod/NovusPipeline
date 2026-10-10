@@ -173,6 +173,16 @@ def extract_code(text: str) -> Optional[str]:
     return None
 
 
+def _defined_callables(code: str) -> set:
+    """Top-level function and class names (module constants/aliases are allowed to be added)."""
+    import ast
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError):
+        return set()
+    return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
+
+
 def validate_proposal(original: str, proposed: Optional[str], required_names: Optional[List[str]] = None) -> Dict[str, Any]:
     """Gate for applying a proposal: parses, introduces no smells, keeps imported symbols."""
     from modernizer import LegacySmellDetector, missing_names, top_level_names
@@ -188,7 +198,15 @@ def validate_proposal(original: str, proposed: Optional[str], required_names: Op
     broken = missing_names(proposed, required_names or [])
     if broken:
         issues.append(f"Removes symbols other modules import: {', '.join(broken)}")
-    old_public = {n for n in (top_level_names(original) or set()) if not n.startswith("_")}
+    # A modernization rewrites existing code; new functions/classes or a __main__ block
+    # are hallucinated scope (seen with the over-trained adapter), not a refactor.
+    old_defs = top_level_names(original, include_imports=False) or set()
+    added = sorted(_defined_callables(proposed) - _defined_callables(original))
+    if added:
+        issues.append(f"Adds top-level definitions not in the original: {', '.join(added[:8])}")
+    if re.search(r"^if\s+__name__\s*==", proposed, re.MULTILINE) and not re.search(r"^if\s+__name__\s*==", original, re.MULTILINE):
+        issues.append("Adds an `if __name__ == '__main__':` block")
+    old_public = {n for n in old_defs if not n.startswith("_")}
     dropped = sorted(old_public - (top_level_names(proposed) or set()))
     return {
         "valid": not issues,

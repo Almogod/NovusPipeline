@@ -200,3 +200,87 @@ judged by the fixed rule engine:
 - Branches `test-auto-pipeline-branch`, `test-final-pr-branch` and
   `test-modernization-branch` were created in this repo by the old tests; they
   are left in place (`git branch -D <name>` to remove).
+
+## Phase 7: Robust GNN Training, Fine-Tuned Adapter Testing, MCP Hardening (COMPLETED)
+
+### GNN training protocol
+- [x] Real training data from installed third-party packages, split by whole
+  package (93 train / 22 val / 19 test, hashed on package name) and capped at
+  25 chunks per package; stdlib split by file. Only training data is
+  counterfactually augmented; evaluation splits are raw real code.
+  Exact-duplicate samples between training and evaluation are removed.
+- [x] Model selection on validation real code only, counting labels with at
+  least 10 validation positives (002/004/005 have 0-1 in real code, so their F1
+  is a coin flip). The Phase 5 sweep had selected on a test split; fixed.
+- [x] GPU training (`--device`), LR-on-plateau, gradient clipping, early
+  stopping; seed ensembles (`--ensemble N`); bootstrap 95% CIs and an
+  invariance suite (rename parameters / reorder definitions / add docstrings)
+  in `eval_gnn.py`.
+- [x] Sweep (2 seeds each, validation real-code F1 on bare-except + type hints):
+  SAGE 4x128 0.9996 (selected; zero variance, 0% false positives), SAGE 3x128
+  0.9992, SAGE 4x64 0.9992, SAGE 3x64 0.9990, GCN 3x128 0.9958.
+- [x] A 5-seed ensemble tied the single model on validation (0.9996); by the
+  rule fixed beforehand (ship an ensemble only if it beats the single model on
+  validation) the single model ships, at 1/5 of the inference cost.
+
+Final model vs previous checkpoint, same harness, 19 never-seen packages:
+
+| | previous (SAGE 3x64) | final (SAGE 4x128) |
+|---|---|---|
+| File-level macro-F1 (95% CI) | 0.953 (0.911-0.965) | 0.998 (0.994-1.0) |
+| 006 file level, recall / precision | 0.755 / 1.0 | 0.994 / 0.994 |
+| 006 per function (1,574 positives), recall / precision | 0.956 / 0.999 | 0.999 / 1.0 |
+| Bare except (6-7 positives) | F1 1.0 | F1 1.0 |
+| Invariance (rename / reorder / docstrings) | 100% / 100% / 99.7% | 100% / 99.7% / 100% |
+| Latency | ~0.3 s / 3.2k nodes, ~1.2 s / 32k | same |
+
+Real-code support for 002/004/005 remains 0-2 positives, so those labels are
+validated by the synthetic and contrast suites (all pass).
+
+### Fine-tuned LoRA adapter (`eval_llm.py`)
+- [x] The adapter had never been applied. It was trained on the multimodal
+  `Qwen3_5ForConditionalGeneration` (weights under `model.language_model.layers.*`);
+  the old loader used the wrong class and lacked torch/peft, and a text-only
+  load leaves PEFT's LoRA layers at their zero init because no saved key
+  matches. `llm_worker.py` remaps the keys, verifies 192/192 tensors loaded
+  with non-zero LoRA B, and refuses to start otherwise.
+- [x] A/B on 8 legacy snippets (same weights, greedy, adapter on/off; parity
+  measured by executing original and rewrite in an isolated subprocess):
+
+  | | adapter | base Qwen3.5-2B | rule engine |
+  |---|---|---|---|
+  | parseable code | 2/8 | 8/8 | 8/8 |
+  | passes validation | 25% | 100% | 100% |
+  | smells resolved | 25% | 94% | 27% |
+  | behavior parity | 15% | 95% | 100% |
+  | speed (RTX 4050) | 6.4 tok/s | 8.5 tok/s | instant |
+
+  The adapter (30 steps, batch 2, ~10 examples) never learned to stop: it
+  drops the requested code fence, invents functions, loops, and hits the
+  token cap. Recommendation: run the base model (`NOVUS_LLM_ADAPTER=0`) until
+  the adapter is retrained on a few hundred legacy->modern pairs with EOS.
+- [x] Even the base model changed behavior once (`except:` ->
+  `except ValueError:`), which only tests can catch; `use_llm` stays opt-in and
+  test-gated.
+
+### LLM integration
+- [x] LLM runs in a separate worker process (`llm_worker.py`, own GPU venv,
+  `requirements-llm.txt`), JSON lines over stdio; restarted on crash, killed on
+  timeout; stderr logged to `%TEMP%/novus_llm_worker.log`. Text-only model
+  class (no vision tower): 3.55 GB VRAM, ~25 s load. LoRA merged for inference
+  unless `NOVUS_LLM_MERGE=0`.
+- [x] Validation gate for proposals: parses, no new rule-engine smells, keeps
+  imported symbols, adds no new functions/classes or `__main__` block.
+- [x] `run_autonomous_modernization_pipeline(use_llm=True)` applies only
+  validated proposals, else falls back to the rule engine; tests gate both.
+
+### MCP hardening
+- [x] All 21 tools carry MCP annotations (read-only / destructive /
+  idempotent), run in worker threads with per-tool timeouts, and raise
+  `ToolError` (isError) instead of returning "Error: ..." as success.
+- [x] Workspace-mutating tools are serialized by a lock.
+- [x] `modernization_workflow` MCP prompt; `get_local_llm_status(probe=true)`
+  reports device, VRAM, adapter verification.
+- [x] Tests: 84 (stub-worker protocol: crash/restart, hang/timeout, valid /
+  API-breaking / hallucinated proposals; LLM pipeline both ways; real stdio
+  server with annotations, isError and concurrent calls).
