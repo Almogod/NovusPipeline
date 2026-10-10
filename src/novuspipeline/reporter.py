@@ -22,7 +22,7 @@ class ModernizationReporter:
         modernization_details: str,
         test_output: str,
         branch_name: str,
-        model_used: str = "unsloth_Qwen3.5-2B_1785882774",
+        model_used: str = "rule engine + structural GNN (optional local LLM)",
         pr_draft_file: str = "",
     ) -> str:
         """Constructs an enterprise-grade Markdown report artifact."""
@@ -35,7 +35,7 @@ class ModernizationReporter:
 **Git Branch**: `{branch_name}`  
 **Generated At**: `{timestamp}`  
 **LLM Engine**: `{model_used}`  
-**RAG Store**: `ChromaDB persistent vector store (.chroma_db)`  
+**RAG Store**: `ChromaDB guideline store (user data dir)`  
 
 ---
 

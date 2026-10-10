@@ -1,22 +1,53 @@
 # NovusPipeline
 
-A local MCP server that modernizes legacy codebases: it detects legacy code smells (rule engine + a graph neural network), retrieves modernization guidelines (RAG), applies behavior-preserving rewrites, verifies them with the project's own tests, and drafts a scoped git PR. A codebase index gives every tool context about the file it is changing: who imports it, which of its symbols they use, which tests cover it, and where the same smells occur elsewhere.
+<!-- mcp-name: io.github.almogod/novuspipeline -->
 
-## Setup
+An MCP server that modernizes legacy Python codebases safely. It finds legacy code smells (rule engine + a graph neural network over the AST), knows the codebase around each file (who imports it, which of its symbols they use, which tests cover it), applies behavior-preserving rewrites, verifies them with your own tests, and commits only the files it changed. Everything runs locally: your code never leaves your machine.
 
-```shell
-python -m venv .venv
-.venv\Scripts\activate            # Windows (source .venv/bin/activate elsewhere)
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements.txt
-python ingest_rag.py              # seed the guideline vector DB
-python train_gnn.py               # train the GNN smell classifier (~10 min on CPU)
-python eval_gnn.py                # optional: stress-test report -> .gnn_model/eval_report.json
+## Install
+
+Requires Python 3.11+. The server runs on your machine and is launched by your MCP client.
+
+| Install | What you get | Size |
+|---|---|---|
+| `uvx novuspipeline` / `pip install novuspipeline` | Rule engine, codebase index (import graph, dependents, related tests), RAG guidelines, test-gated pipeline, git PR drafts | small |
+| `novuspipeline[gnn]` | + structural GNN: smell cross-check, per-function localization, `find_similar_code` | + torch (CPU) |
+| `novuspipeline[llm]` | + local LLM proposals (`use_llm`), validated and test-gated | + torch, transformers; NVIDIA GPU with ~4 GB free VRAM recommended |
+
+On Linux, install CPU torch first to avoid a multi-GB CUDA download: `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
+
+## Connect your MCP client
+
+Claude Desktop (`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`) and similar clients:
+
+```json
+{
+  "mcpServers": {
+    "novuspipeline": {
+      "command": "uvx",
+      "args": ["--from", "novuspipeline[gnn]", "novuspipeline", "--workspace", "/absolute/path/to/your/project"]
+    }
+  }
+}
 ```
 
-Optional local LLM (needs an NVIDIA GPU with ~4 GB free VRAM): create `.venv-llm` as described in `requirements-llm.txt`. The server then starts `llm_worker.py` in that environment on first use. `NOVUS_LLM_PATH` points at the LoRA adapter; `NOVUS_LLM_ADAPTER=0` uses the base model only, which currently performs much better (see `phases.md`, Phase 7, and `python eval_llm.py`).
+Claude Code: `claude mcp add novuspipeline -- uvx --from "novuspipeline[gnn]" novuspipeline --workspace /path/to/project`
 
-Register the server with your MCP client using `mcp_config_snippet.json`. Set `NOVUS_WORKSPACE_ROOT` to the codebase you want to modernize (defaults to the server's working directory). `NOVUS_PYTHON` overrides the interpreter used to run tests; by default the workspace's own `.venv`/`venv` is used.
+Then ask your agent to use the `modernization_workflow` prompt, or call `get_codebase_overview` to start.
+
+## Settings
+
+| Option | Purpose |
+|---|---|
+| `--workspace DIR` / `NOVUS_WORKSPACE_ROOT` | The codebase to modernize (default: current directory) |
+| `--transport http --port 8000` | Serve over HTTP instead of stdio. No authentication: keep it on `127.0.0.1` |
+| `NOVUS_PYTHON` | Interpreter for running your tests (default: the workspace's `.venv`/`venv`, else the server's) |
+| `NOVUS_DATA_DIR` | Where the guideline database lives (default: your user data directory) |
+| `NOVUS_GNN_DIR` | Use a retrained GNN checkpoint instead of the bundled one |
+| `NOVUS_LLM_BASE_MODEL` | Hugging Face model for LLM proposals (default `unsloth/Qwen3.5-2B`, downloaded on first use) |
+| `NOVUS_LLM_PATH` | Optional LoRA adapter directory |
+| `NOVUS_LLM_PYTHON` | Run the LLM worker in a separate (GPU) environment |
+| `NOVUS_LLM_OFFLINE=1` | Never download models; use the local Hugging Face cache only |
 
 ## Tools
 
@@ -29,14 +60,22 @@ Register the server with your MCP client using `mcp_config_snippet.json`. Set `N
 | Guidelines (RAG) | `query_rag_guidelines`, `search_rag_by_id`, `ingest_rag_document`, `get_rag_stats`, `reset_rag_database` |
 | Status | `get_gnn_model_status`, `get_local_llm_status` |
 
-A typical session: `get_codebase_overview` to pick a hotspot, `get_file_context` to see its blast radius, then `run_autonomous_modernization_pipeline` on it. The pipeline runs the tests that import the file, rolls back on failure or on a broken public API, commits only that file, and lists follow-up files with the same smells.
+Tools are annotated read-only or destructive so clients can ask before changing anything. The pipeline runs the tests that import the target file, rolls back on failure or if a symbol other modules import would disappear, and commits only that file on a new branch.
 
-`run_local_tests` only runs test-runner commands (`python -m pytest|unittest`, `pytest`, `npm test`, `npm run test[:x]`, `node --test`, `npx jest|vitest|mocha`, `cargo test`, `go test`, `mvn test`, `gradle test`).
+**Safety notes.** `run_local_tests` only accepts test-runner commands (`python -m pytest|unittest`, `pytest`, `npm test`, `npm run test[:x]`, `node --test`, `npx jest|vitest|mocha`, `cargo test`, `go test`, `mvn test`, `gradle test`), but your test suite itself runs with your permissions, as it would in your terminal. Only point the server at code you trust to run.
 
 ## Development
 
 ```shell
-python -m unittest test_server -v
+git clone https://github.com/Almogod/NovusPipeline && cd NovusPipeline
+python -m venv .venv && .venv/Scripts/activate        # source .venv/bin/activate on macOS/Linux
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e ".[gnn]"
+python -m unittest discover -s tests -v                # git/file tests run in throwaway repos
+
+python -m novuspipeline.train_gnn --device auto        # retrain the GNN (GPU recommended)
+python -m novuspipeline.eval_gnn                       # stress test on held-out packages
+python -m novuspipeline.eval_llm                       # base model vs. LoRA adapter A/B
 ```
 
-Tests that touch git or write files run in a throwaway repository; the suite never changes this repository's branches or working tree. See `phases.md` for the change history and the GNN evaluation results, and `architecture.md` / `rules.md` for design and refactoring constraints.
+`phases.md` records the design history and evaluation results; `architecture.md` and `rules.md` describe the design and refactoring constraints. MIT licensed.

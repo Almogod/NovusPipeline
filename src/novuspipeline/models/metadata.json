@@ -1,0 +1,182 @@
+{
+  "trained_at": "2026-10-09 17:48:05 UTC",
+  "labels": [
+    "PY-SMELL-002",
+    "PY-SMELL-003",
+    "PY-SMELL-004",
+    "PY-SMELL-005",
+    "PY-SMELL-006"
+  ],
+  "config": {
+    "conv": "sage",
+    "num_layers": 4,
+    "hidden_dim": 128,
+    "type_embed_dim": 32,
+    "field_embed_dim": 16,
+    "token_embed_dim": 32,
+    "dropout": 0.1,
+    "use_tokens": true
+  },
+  "thresholds": {
+    "PY-SMELL-002": 0.5,
+    "PY-SMELL-003": 0.5,
+    "PY-SMELL-004": 0.5,
+    "PY-SMELL-005": 0.5,
+    "PY-SMELL-006": 0.5
+  },
+  "members": [
+    "smell_gnn.pt"
+  ],
+  "seed": 42,
+  "ensemble": 1,
+  "lr": 0.001,
+  "epochs_trained": [
+    28
+  ],
+  "num_samples": 2000,
+  "real_samples": 2000,
+  "package_chunks": 25,
+  "split_sizes": {
+    "train": 7838,
+    "val": 1423,
+    "test": 676,
+    "val_real": 1123,
+    "test_real": 376,
+    "test_external": 885
+  },
+  "val": {
+    "macro_f1": 0.9999,
+    "reliable_macro_f1": 0.9999,
+    "per_label_f1": {
+      "PY-SMELL-002": 1.0,
+      "PY-SMELL-003": 1.0,
+      "PY-SMELL-004": 1.0,
+      "PY-SMELL-005": 1.0,
+      "PY-SMELL-006": 0.9994
+    },
+    "support": {
+      "PY-SMELL-002": 74,
+      "PY-SMELL-003": 99,
+      "PY-SMELL-004": 86,
+      "PY-SMELL-005": 88,
+      "PY-SMELL-006": 798
+    },
+    "false_positive_rate": {
+      "PY-SMELL-002": 0.0,
+      "PY-SMELL-003": 0.0,
+      "PY-SMELL-004": 0.0,
+      "PY-SMELL-005": 0.0,
+      "PY-SMELL-006": 0.0
+    },
+    "exact_match": 0.9993,
+    "samples": 1423
+  },
+  "val_real": {
+    "macro_f1": 0.9997,
+    "reliable_macro_f1": 0.9996,
+    "per_label_f1": {
+      "PY-SMELL-002": null,
+      "PY-SMELL-003": 1.0,
+      "PY-SMELL-004": null,
+      "PY-SMELL-005": 1.0,
+      "PY-SMELL-006": 0.9992
+    },
+    "support": {
+      "PY-SMELL-002": 0,
+      "PY-SMELL-003": 16,
+      "PY-SMELL-004": 0,
+      "PY-SMELL-005": 1,
+      "PY-SMELL-006": 657
+    },
+    "false_positive_rate": {
+      "PY-SMELL-002": 0.0,
+      "PY-SMELL-003": 0.0,
+      "PY-SMELL-004": 0.0,
+      "PY-SMELL-005": 0.0,
+      "PY-SMELL-006": 0.0
+    },
+    "exact_match": 0.9991,
+    "samples": 1123
+  },
+  "test": {
+    "macro_f1": 0.999,
+    "reliable_macro_f1": 0.999,
+    "per_label_f1": {
+      "PY-SMELL-002": 1.0,
+      "PY-SMELL-003": 0.9948,
+      "PY-SMELL-004": 1.0,
+      "PY-SMELL-005": 1.0,
+      "PY-SMELL-006": 1.0
+    },
+    "support": {
+      "PY-SMELL-002": 81,
+      "PY-SMELL-003": 95,
+      "PY-SMELL-004": 91,
+      "PY-SMELL-005": 79,
+      "PY-SMELL-006": 493
+    },
+    "false_positive_rate": {
+      "PY-SMELL-002": 0.0,
+      "PY-SMELL-003": 0.0017,
+      "PY-SMELL-004": 0.0,
+      "PY-SMELL-005": 0.0,
+      "PY-SMELL-006": 0.0
+    },
+    "exact_match": 0.9985,
+    "samples": 676
+  },
+  "test_real": {
+    "macro_f1": 0.99,
+    "reliable_macro_f1": 0.98,
+    "per_label_f1": {
+      "PY-SMELL-002": null,
+      "PY-SMELL-003": 0.96,
+      "PY-SMELL-004": 1.0,
+      "PY-SMELL-005": 1.0,
+      "PY-SMELL-006": 1.0
+    },
+    "support": {
+      "PY-SMELL-002": 0,
+      "PY-SMELL-003": 12,
+      "PY-SMELL-004": 1,
+      "PY-SMELL-005": 1,
+      "PY-SMELL-006": 357
+    },
+    "false_positive_rate": {
+      "PY-SMELL-002": 0.0,
+      "PY-SMELL-003": 0.0027,
+      "PY-SMELL-004": 0.0,
+      "PY-SMELL-005": 0.0,
+      "PY-SMELL-006": 0.0
+    },
+    "exact_match": 0.9973,
+    "samples": 376
+  },
+  "test_external": {
+    "macro_f1": 1.0,
+    "reliable_macro_f1": 1.0,
+    "per_label_f1": {
+      "PY-SMELL-002": null,
+      "PY-SMELL-003": 1.0,
+      "PY-SMELL-004": null,
+      "PY-SMELL-005": null,
+      "PY-SMELL-006": 1.0
+    },
+    "support": {
+      "PY-SMELL-002": 0,
+      "PY-SMELL-003": 8,
+      "PY-SMELL-004": 0,
+      "PY-SMELL-005": 0,
+      "PY-SMELL-006": 365
+    },
+    "false_positive_rate": {
+      "PY-SMELL-002": 0.0,
+      "PY-SMELL-003": 0.0,
+      "PY-SMELL-004": 0.0,
+      "PY-SMELL-005": 0.0011,
+      "PY-SMELL-006": 0.0
+    },
+    "exact_match": 0.9989,
+    "samples": 885
+  }
+}

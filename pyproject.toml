@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "novuspipeline"
+dynamic = ["version"]
+description = "Codebase-aware legacy code modernization MCP server: rule engine + structural GNN + RAG + test-gated git PRs"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Almogod" }]
+requires-python = ">=3.11"
+keywords = ["mcp", "model-context-protocol", "refactoring", "modernization", "legacy-code", "gnn"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "fastmcp>=4.0,<5",
+    "chromadb>=1.5,<2",
+    "GitPython>=3.1",
+    "pydantic>=2",
+    "platformdirs>=4",
+]
+
+[project.optional-dependencies]
+# Structural GNN (smell cross-check, per-function localization, similarity search).
+# On Linux, install CPU torch first to avoid a multi-GB CUDA download:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+gnn = ["torch>=2.4", "torch-geometric>=2.6"]
+# Local LLM worker (GPU recommended); also usable from a separate env via NOVUS_LLM_PYTHON.
+llm = ["torch>=2.4", "transformers>=5.0", "peft>=0.18", "accelerate>=1.0", "safetensors>=0.4"]
+all = ["novuspipeline[gnn,llm]"]
+
+[project.scripts]
+novuspipeline = "novuspipeline.server:main"
+
+[project.urls]
+Homepage = "https://github.com/Almogod/NovusPipeline"
+Issues = "https://github.com/Almogod/NovusPipeline/issues"
+
+[tool.hatch.version]
+path = "src/novuspipeline/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/novuspipeline"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/novuspipeline", "tests", "README.md", "LICENSE", "phases.md", "architecture.md", "rules.md"]

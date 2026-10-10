@@ -1,11 +1,14 @@
 """
 llm_worker.py — NovusPipeline local LLM worker process
 
-Hosts the fine-tuned Unsloth Qwen3.5-2B LoRA adapter (on its base model) in a
-separate process with its own (GPU-capable) environment, so the MCP server
-stays light and a CUDA out-of-memory error cannot take it down. `local_llm.py`
-starts this script with NOVUS_LLM_PYTHON (default: ./.venv-llm) and talks to it
-with one JSON object per line:
+Hosts a local LLM (NOVUS_LLM_BASE_MODEL, default unsloth/Qwen3.5-2B, plus an
+optional LoRA adapter at NOVUS_LLM_PATH) in a separate process with its own
+(GPU-capable) environment, so the MCP server stays light and a CUDA
+out-of-memory error cannot take it down. Model files come from the Hugging Face
+cache, downloading on first use unless NOVUS_LLM_OFFLINE=1. This script imports
+nothing from the package, so it runs under any interpreter with torch +
+transformers (+ peft for adapters). `local_llm.py` talks to it with one JSON
+object per line:
 
   request  {"id": 1, "op": "status"}
            {"id": 2, "op": "generate", "messages": [...], "max_new_tokens": 512, "adapter": true}
@@ -21,8 +24,10 @@ import sys
 import time
 import traceback
 
-ADAPTER_PATH = os.environ.get(
-    "NOVUS_LLM_PATH", r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774")
+ADAPTER_PATH = os.environ.get("NOVUS_LLM_PATH", "")
+BASE_MODEL = os.environ.get("NOVUS_LLM_BASE_MODEL", "unsloth/Qwen3.5-2B")
+USE_ADAPTER = bool(ADAPTER_PATH) and os.environ.get("NOVUS_LLM_ADAPTER", "1") != "0"
+OFFLINE = os.environ.get("NOVUS_LLM_OFFLINE") == "1"
 
 _state = {"model": None, "tokenizer": None, "device": None, "load_seconds": None, "load_error": None,
           "base_model": None, "model_class": None, "adapter_tensors": None, "adapter_verified": False,
@@ -72,21 +77,25 @@ def load() -> None:
     try:
         import torch
         import transformers
-        from peft import PeftConfig, PeftModel
         from transformers import AutoTokenizer
 
-        cfg = PeftConfig.from_pretrained(ADAPTER_PATH)
+        base_name = BASE_MODEL
+        if USE_ADAPTER:
+            from peft import PeftConfig
+            base_name = PeftConfig.from_pretrained(ADAPTER_PATH).base_model_name_or_path
         cuda = torch.cuda.is_available()
         dtype = torch.bfloat16 if cuda and torch.cuda.is_bf16_supported() else (torch.float16 if cuda else torch.float32)
-        # The adapter was trained on the multimodal Qwen3_5ForConditionalGeneration; prefer the
-        # text-only causal LM class when transformers provides one (no vision tower in memory).
-        model_cls = getattr(transformers, "Qwen3_5ForCausalLM", None) or getattr(transformers, "AutoModelForImageTextToText")
-        base = model_cls.from_pretrained(cfg.base_model_name_or_path, dtype=dtype,
-                                         device_map="cuda" if cuda else None, local_files_only=True)
-        if os.environ.get("NOVUS_LLM_ADAPTER", "1") == "0":
-            # Base model only: eval_llm.py showed the current adapter degrades code output.
+        # Qwen3.5 checkpoints are multimodal; the text-only causal LM class skips the vision
+        # tower. Other base models load through AutoModelForCausalLM.
+        model_cls = (getattr(transformers, "Qwen3_5ForCausalLM", None) if "qwen3.5" in base_name.lower() else None) \
+            or transformers.AutoModelForCausalLM
+        base = model_cls.from_pretrained(base_name, dtype=dtype, device_map="cuda" if cuda else None,
+                                         local_files_only=OFFLINE)
+        if not USE_ADAPTER:
+            # Base model only (no adapter configured, or NOVUS_LLM_ADAPTER=0).
             model, adapter_tensors, merged = base, "disabled", True
         else:
+            from peft import PeftModel
             model = PeftModel.from_pretrained(base, ADAPTER_PATH)
             adapter_tensors = load_adapter_weights(model)
             # Merging folds LoRA into the base weights: no per-token adapter overhead, but
@@ -95,9 +104,9 @@ def load() -> None:
             if merged:
                 model = model.merge_and_unload()
         model.eval()
-        tokenizer = AutoTokenizer.from_pretrained(ADAPTER_PATH)
+        tokenizer = AutoTokenizer.from_pretrained(ADAPTER_PATH if USE_ADAPTER else base_name, local_files_only=OFFLINE)
         _state.update(model=model, tokenizer=tokenizer, device=str(next(model.parameters()).device),
-                      base_model=cfg.base_model_name_or_path, model_class=model_cls.__name__,
+                      base_model=base_name, model_class=model_cls.__name__,
                       adapter_tensors=adapter_tensors, adapter_verified=adapter_tensors != "disabled", merged=merged,
                       load_seconds=round(time.perf_counter() - start, 1))
         log(f"loaded {model_cls.__name__} + adapter ({adapter_tensors} tensors verified, merged={merged}) "
@@ -110,7 +119,7 @@ def load() -> None:
 def status() -> dict:
     info = {k: v for k, v in _state.items() if k not in ("model", "tokenizer")}
     info["loaded"] = _state["model"] is not None
-    info["adapter_path"] = ADAPTER_PATH
+    info["adapter_path"] = ADAPTER_PATH or None
     try:
         import torch
         info["cuda"] = torch.cuda.is_available()

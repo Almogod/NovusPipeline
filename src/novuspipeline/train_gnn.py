@@ -15,9 +15,9 @@ The corpus is built to remove the shortcuts the first version learned:
   - file sizes from 1 to ~40 functions, closer to real source files
 
 Usage:
-    python train_gnn.py                       # train with defaults, save checkpoint
-    python train_gnn.py --conv gcn --seed 7   # override architecture / seed
-    python train_gnn.py --sweep 42 7 123      # compare seeds without saving
+    python -m novuspipeline.train_gnn                       # train with defaults, save checkpoint
+    python -m novuspipeline.train_gnn --conv gcn --seed 7   # override architecture / seed
+    python -m novuspipeline.train_gnn --sweep 42 7 123      # compare seeds without saving
 """
 
 import argparse
@@ -32,9 +32,9 @@ import time
 from dataclasses import asdict, replace
 from typing import Callable, Dict, List, Optional, Tuple
 
-from code_graph import build_graph_from_code
-from gnn_model import SMELL_LABELS, GNNConfig, build_model, graph_dict_to_pyg_data, save_checkpoint
-from modernizer import LegacySmellDetector
+from .code_graph import build_graph_from_code
+from .gnn_model import SMELL_LABELS, GNNConfig, build_model, graph_dict_to_pyg_data, save_checkpoint
+from .modernizer import LegacySmellDetector
 
 # ---------------------------------------------------------------------------
 # Teacher

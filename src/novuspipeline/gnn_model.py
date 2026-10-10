@@ -21,7 +21,7 @@ import time
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
-from code_graph import (
+from .code_graph import (
     FIELD_NAMES,
     NODE_TYPES,
     NUM_SCALAR_FEATURES,
@@ -53,7 +53,8 @@ class GNNConfig:
     use_tokens: bool = True       # ablation switch: False reproduces the type-only model
 
 
-_MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".gnn_model")
+# The trained checkpoint ships inside the package; NOVUS_GNN_DIR points at a retrained one.
+_MODEL_DIR = os.environ.get("NOVUS_GNN_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 CHECKPOINT_PATH = os.path.join(_MODEL_DIR, "smell_gnn.pt")
 METADATA_PATH = os.path.join(_MODEL_DIR, "metadata.json")
 
@@ -69,8 +70,8 @@ def _require_torch():
         return torch
     except ImportError as e:
         raise RuntimeError(
-            "GNN features require 'torch' and 'torch_geometric' to be installed "
-            f"in this environment. Original import error: {e}"
+            'GNN features need the optional extra: pip install "novuspipeline[gnn]" '
+            f"(torch + torch_geometric). Import error: {e}"
         )
 
 

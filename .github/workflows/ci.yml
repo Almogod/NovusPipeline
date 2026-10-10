@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install CPU-only torch (Linux/Windows; avoids multi-GB CUDA wheels)
+        if: runner.os != 'macOS'
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Install package with the GNN extra
+        run: pip install -e ".[gnn]"
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install build
+      - run: python -m build
+      - name: Smoke-test the built wheel in a clean environment
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install dist/*.whl
+          /tmp/fresh/bin/novuspipeline --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/

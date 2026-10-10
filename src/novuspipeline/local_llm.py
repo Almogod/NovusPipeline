@@ -1,32 +1,48 @@
 r"""
 local_llm.py — NovusPipeline Local LLM Modernization Engine (client side)
 
-Talks to `llm_worker.py`, a separate process that hosts the fine-tuned Unsloth
-Qwen3.5-2B LoRA adapter on its base model. The worker runs under its own
-interpreter (NOVUS_LLM_PYTHON, default ./.venv-llm) so GPU dependencies and
-~4.5 GB of weights stay out of the MCP server process.
+Talks to `llm_worker.py`, a separate process that hosts a local LLM (by default
+the base model `unsloth/Qwen3.5-2B`, optionally with a LoRA adapter). The
+worker runs under its own interpreter so GPU dependencies and ~4.5 GB of
+weights stay out of the MCP server process.
+
+Configuration (environment):
+  NOVUS_LLM_BASE_MODEL  Hugging Face model id (default unsloth/Qwen3.5-2B)
+  NOVUS_LLM_PATH        optional LoRA adapter directory
+  NOVUS_LLM_PYTHON      worker interpreter; default: a dev `.venv-llm` next to the
+                        repo, else this interpreter if `transformers` + `torch` are
+                        installed (pip install "novuspipeline[llm]")
 
 Every proposal is validated before anyone may apply it: it must parse, must not
 introduce rule-engine smells, and must keep every symbol other modules import.
 Without a worker (or with NOVUS_FAST_TEST=1) the rule-based modernizer is used.
 """
 
+import importlib.util
 import json
 import logging
 import os
 import queue
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-LOCAL_MODEL_PATH = os.environ.get(
-    "NOVUS_LLM_PATH", r"C:\Users\Hp\.unsloth\studio\outputs\unsloth_Qwen3.5-2B_1785882774")
-MODEL_NAME = os.path.basename(LOCAL_MODEL_PATH.rstrip("\\/"))
+DEFAULT_BASE_MODEL = "unsloth/Qwen3.5-2B"
 WORKER_SCRIPT = os.path.join(_HERE, "llm_worker.py")
+
+
+def adapter_path() -> str:
+    return os.environ.get("NOVUS_LLM_PATH", "")
+
+
+def model_name() -> str:
+    path = adapter_path()
+    return os.path.basename(path.rstrip("\\/")) if path else os.environ.get("NOVUS_LLM_BASE_MODEL", DEFAULT_BASE_MODEL)
 # Worker stderr (load progress, tracebacks) — kept for diagnosing load/OOM failures.
 WORKER_LOG = os.path.join(tempfile.gettempdir(), "novus_llm_worker.log")
 LOAD_TIMEOUT_SECONDS = 600
@@ -42,13 +58,16 @@ SYSTEM_PROMPT = (
 
 
 def llm_python() -> Optional[str]:
-    """Interpreter for the worker: NOVUS_LLM_PYTHON, else the repo's .venv-llm, else None."""
+    """Worker interpreter: NOVUS_LLM_PYTHON, a dev .venv-llm, this interpreter with [llm] installed, else None."""
     if os.environ.get("NOVUS_LLM_PYTHON"):
         return os.environ["NOVUS_LLM_PYTHON"]
+    repo_root = os.path.dirname(os.path.dirname(_HERE))  # src/novuspipeline -> repo
     for rel in ((".venv-llm", "Scripts", "python.exe"), (".venv-llm", "bin", "python")):
-        candidate = os.path.join(_HERE, *rel)
+        candidate = os.path.join(repo_root, *rel)
         if os.path.isfile(candidate):
             return candidate
+    if importlib.util.find_spec("transformers") and importlib.util.find_spec("torch"):
+        return sys.executable
     return None
 
 
@@ -64,8 +83,8 @@ class LLMWorker:
     def _start(self) -> None:
         python = llm_python()
         if python is None:
-            raise RuntimeError("No LLM interpreter: create .venv-llm (see README) or set NOVUS_LLM_PYTHON.")
-        env = dict(os.environ, NOVUS_LLM_PATH=LOCAL_MODEL_PATH, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+            raise RuntimeError('No LLM interpreter: pip install "novuspipeline[llm]" or set NOVUS_LLM_PYTHON.')
+        env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         with open(WORKER_LOG, "a", encoding="utf-8") as log:
             self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=log, text=True, encoding="utf-8", env=env)
@@ -116,25 +135,26 @@ _WORKER = LLMWorker()
 
 
 def get_model_info(probe: bool = False) -> Dict[str, Any]:
-    """Static adapter info; with `probe`, starts the worker and loads the model to report device/VRAM."""
+    """Static configuration; with `probe`, starts the worker and loads the model to report device/VRAM."""
+    adapter = adapter_path()
     info: Dict[str, Any] = {
-        "model_path": LOCAL_MODEL_PATH,
-        "exists": os.path.exists(LOCAL_MODEL_PATH),
-        "has_adapter_config": os.path.exists(os.path.join(LOCAL_MODEL_PATH, "adapter_config.json")),
-        "model_name": MODEL_NAME,
-        "base_model": "unsloth/Qwen3.5-2B",
+        "adapter_path": adapter or None,
+        "adapter_found": bool(adapter) and os.path.exists(os.path.join(adapter, "adapter_config.json")),
+        "model_name": model_name(),
+        "base_model": os.environ.get("NOVUS_LLM_BASE_MODEL", DEFAULT_BASE_MODEL),
         "worker_python": llm_python(),
         "worker_running": _WORKER.running,
         "worker_log": WORKER_LOG,
     }
-    try:
-        with open(os.path.join(LOCAL_MODEL_PATH, "adapter_config.json"), "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        info.update(base_model=cfg.get("base_model_name_or_path", info["base_model"]),
-                    lora_rank=cfg.get("r"), lora_alpha=cfg.get("lora_alpha"),
-                    training_method=cfg.get("unsloth_training_method"))
-    except (OSError, ValueError):
-        pass
+    if info["adapter_found"]:
+        try:
+            with open(os.path.join(adapter, "adapter_config.json"), "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            info.update(base_model=cfg.get("base_model_name_or_path", info["base_model"]),
+                        lora_rank=cfg.get("r"), lora_alpha=cfg.get("lora_alpha"),
+                        training_method=cfg.get("unsloth_training_method"))
+        except (OSError, ValueError):
+            pass
     if probe:
         try:
             resp = _WORKER.request("load", LOAD_TIMEOUT_SECONDS)
@@ -185,7 +205,7 @@ def _defined_callables(code: str) -> set:
 
 def validate_proposal(original: str, proposed: Optional[str], required_names: Optional[List[str]] = None) -> Dict[str, Any]:
     """Gate for applying a proposal: parses, introduces no smells, keeps imported symbols."""
-    from modernizer import LegacySmellDetector, missing_names, top_level_names
+    from .modernizer import LegacySmellDetector, missing_names, top_level_names
 
     if proposed is None:
         return {"valid": False, "issues": ["No parseable Python code in the model output."]}
@@ -228,7 +248,7 @@ def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_contex
     Structured LLM proposal: {"engine", "code", "raw", "validation", "stats", "error"}.
     Falls back to the rule-based modernizer when no worker is available.
     """
-    from modernizer import CodeModernizer
+    from .modernizer import CodeModernizer
 
     def rule_based(reason: str) -> Dict[str, Any]:
         code, changes = CodeModernizer.modernize_python(legacy_code)
@@ -247,6 +267,6 @@ def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_contex
     if not resp.get("ok"):
         return rule_based(resp.get("error", "worker error"))
     code = extract_code(resp["text"])
-    return {"engine": f"{MODEL_NAME}{'' if adapter else ' (adapter disabled)'}", "code": code, "raw": resp["text"],
+    return {"engine": f"{model_name()}{'' if adapter else ' (adapter disabled)'}", "code": code, "raw": resp["text"],
             "validation": validate_proposal(legacy_code, code, required_names), "stats": resp.get("stats", {}),
             "error": None}

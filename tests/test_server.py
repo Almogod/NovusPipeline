@@ -8,18 +8,16 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("NOVUS_FAST_TEST", "1")  # never load the multi-GB local LLM in tests
+# Keep the guideline DB out of the user's real data directory (read at import time).
+os.environ.setdefault("NOVUS_DATA_DIR", tempfile.mkdtemp(prefix="novus-test-data-"))
 
 import git
 
-import codebase_context
-import gnn_model
-import ingest_rag
-import local_llm
-import server
-from code_graph import NODE_TYPES, build_graph_from_code, identifier_bucket
-from modernizer import CodeModernizer, LegacySmellDetector, mask_strings_and_comments
-from reporter import ModernizationReporter
-from server import (
+from novuspipeline import codebase_context, gnn_model, ingest_rag, local_llm, server
+from novuspipeline.code_graph import NODE_TYPES, build_graph_from_code, identifier_bucket
+from novuspipeline.modernizer import CodeModernizer, LegacySmellDetector, mask_strings_and_comments
+from novuspipeline.reporter import ModernizationReporter
+from novuspipeline.server import (
     analyze_code_structure_gnn,
     analyze_legacy_codebase,
     apply_code_modernization,
@@ -174,7 +172,7 @@ class TestRag(unittest.TestCase):
         self.assertEqual(ingest_rag.TFIDFEmbeddingFunction()._tokenize("TaskGroup"), ["task", "group"])
 
     def test_stable_token_index_deterministic_across_processes(self):
-        script = "from ingest_rag import stable_token_index; print(stable_token_index('python', 256))"
+        script = "from novuspipeline.ingest_rag import stable_token_index; print(stable_token_index('python', 256))"
         outputs = {subprocess.run([sys.executable, "-c", script], cwd=os.path.dirname(os.path.abspath(__file__)),
                                   capture_output=True, text=True).stdout.strip() for _ in range(2)}
         self.assertEqual(len(outputs), 1, outputs)
@@ -622,7 +620,7 @@ class TestLlmWorkerProtocol(StubWorkerTestCase):
                    "        return int(s)\n    except ValueError:\n        return default\n```\n- typed")
         legacy = "def to_int(s, default=0):\n    try:\n        return int(s)\n    except:\n        return default\n"
         p = local_llm.propose_modernization(legacy, "rules", required_names=["to_int"])
-        self.assertEqual(p["engine"], local_llm.MODEL_NAME)
+        self.assertEqual(p["engine"], local_llm.model_name())
         self.assertTrue(p["validation"]["valid"], p["validation"])
         self.assertEqual(p["validation"]["resolved"], ["PY-SMELL-003", "PY-SMELL-006"])
 
@@ -688,7 +686,7 @@ class TestMcpProtocol(WorkspaceTestCase):
     def test_server_over_stdio(self):
         import asyncio
         from fastmcp import Client
-        from fastmcp.client.transports import PythonStdioTransport
+        from fastmcp.client.transports import StdioTransport
         from fastmcp.exceptions import ToolError
 
         self.write("lib.py", LEGACY_MODULE)
@@ -697,8 +695,7 @@ class TestMcpProtocol(WorkspaceTestCase):
         env = {**os.environ, "NOVUS_WORKSPACE_ROOT": self.root, "NOVUS_FAST_TEST": "1"}
 
         async def scenario() -> None:
-            transport = PythonStdioTransport(script_path=os.path.join(repo, "server.py"), python_cmd=sys.executable,
-                                             cwd=repo, env=env)
+            transport = StdioTransport(command=sys.executable, args=["-m", "novuspipeline"], cwd=repo, env=env)
             async with Client(transport) as client:
                 tools = {t.name: t for t in await client.list_tools()}
                 self.assertEqual(len(tools), 21)
@@ -735,7 +732,7 @@ class TestLlmAndReporting(unittest.TestCase):
     def test_get_local_llm_status(self):
         res = get_local_llm_status()
         self.assertIn("Integrated Local LLM Status", res)
-        self.assertIn("unsloth_Qwen3.5-2B_1785882774", res)
+        self.assertIn("Qwen3.5-2B", res)
 
     def test_prompt_includes_codebase_context(self):
         prompt = local_llm.generate_modernization_prompt("x = 1", "rules", codebase_context="Imported by app.py")

@@ -15,7 +15,7 @@ decoding) — plus the rule-based modernizer, and scores every output on:
   tokens/s, seconds
 
 Usage:
-    python eval_llm.py            # writes .llm_eval/report.json and prints a summary
+    python -m novuspipeline.eval_llm            # writes .llm_eval/report.json and prints a summary
 """
 
 import json
@@ -27,8 +27,8 @@ import time
 from collections import Counter
 from typing import Any, Dict, List, Optional
 
-import local_llm
-from modernizer import CodeModernizer, LegacySmellDetector, top_level_names
+from . import local_llm
+from .modernizer import CodeModernizer, LegacySmellDetector, top_level_names
 
 GUIDELINES = (
     "- Replace urllib2 with urllib.request (or httpx).\n"

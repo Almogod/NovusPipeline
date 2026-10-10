@@ -28,8 +28,8 @@ import threading
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import gnn_model
-from modernizer import LegacySmellDetector
+from . import gnn_model
+from .modernizer import LegacySmellDetector
 
 INDEX_VERSION = 2  # bump when stored record format changes; older indexes are rebuilt
 INDEX_DIRNAME = ".novus_index"

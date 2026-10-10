@@ -6,5 +6,9 @@ __pycache__/
 .gnn_model/
 .novus_index/
 .llm_eval/
+src/novuspipeline/models/eval_report.json
+dist/
+build/
+*.egg-info/
 *.bak
 .novus_pr_*.md

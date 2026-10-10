@@ -6,7 +6,7 @@ guidelines using an offline TF-IDF-weighted embedding function for accurate
 keyword-driven semantic retrieval without any external API calls.
 
 Usage:
-    python ingest_rag.py
+    python -m novuspipeline.ingest_rag
 """
 
 import os
@@ -19,9 +19,17 @@ from collections import Counter
 import chromadb
 from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
+def data_dir() -> str:
+    """Per-user, writable tool data (installed packages may be read-only): NOVUS_DATA_DIR overrides."""
+    if os.environ.get("NOVUS_DATA_DIR"):
+        return os.environ["NOVUS_DATA_DIR"]
+    from platformdirs import user_data_dir
+    return user_data_dir("novuspipeline", appauthor=False)
+
+
 # The guideline store belongs to the tool, not to whichever codebase the server
-# is pointed at, so it lives next to this module.
-CHROMA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".chroma_db")
+# is pointed at, so it lives in the user's data directory.
+CHROMA_DIR = os.path.join(data_dir(), "chroma")
 COLLECTION_NAME = "novus_guidelines"
 EMBEDDING_DIM = 256
 # Bump whenever tokenization/weighting changes: stored vectors built with a
@@ -313,6 +321,15 @@ def get_collection(create: bool = False):
         if data["ids"]:
             collection.upsert(ids=data["ids"], documents=data["documents"], metadatas=data["metadatas"])
         _safe_print(f"[NovusPipeline RAG] Re-embedded {len(data['ids'])} documents with {EMBEDDING_VERSION}.")
+    return collection
+
+
+def ensure_seeded():
+    """The guideline collection, seeding the built-in guidelines first if it is missing or empty."""
+    collection = get_collection()
+    if collection is None or collection.count() == 0:
+        seed_rag_database(reset=False)
+        collection = get_collection()
     return collection
 
 

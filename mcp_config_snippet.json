@@ -1,14 +1,8 @@
 {
   "mcpServers": {
-    "NovusPipeline": {
-      "command": "C:\\Users\\Hp\\Downloads\\NovusPipeline\\.venv\\Scripts\\python.exe",
-      "args": [
-        "C:\\Users\\Hp\\Downloads\\NovusPipeline\\server.py"
-      ],
-      "env": {
-        "PYTHONUNBUFFERED": "1",
-        "NOVUS_WORKSPACE_ROOT": "C:\\Users\\Hp\\Downloads\\NovusPipeline"
-      }
+    "novuspipeline": {
+      "command": "uvx",
+      "args": ["--from", "novuspipeline[gnn]", "novuspipeline", "--workspace", "/absolute/path/to/your/project"]
     }
   }
 }

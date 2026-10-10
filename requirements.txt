@@ -1,14 +1,15 @@
-# NovusPipeline dependencies.
-# Install with: pip install -r requirements.txt
-# For CPU-only torch (recommended unless you have a CUDA GPU), install torch first via:
-#   pip install torch --index-url https://download.pytorch.org/whl/cpu
-# then the rest of this file.
+# Exact versions of the development environment the tests and the shipped GNN
+# checkpoint were produced with. Package dependencies (with ranges) are defined
+# in pyproject.toml; users install with `pip install "novuspipeline[gnn]"`.
+#
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+#   pip install -r requirements.txt && pip install -e . --no-deps
 
 fastmcp==4.0.10
 chromadb==1.5.9
 GitPython==3.2.0
 pydantic==2.13.5
+platformdirs>=4
 
-# Phase 5: GNN structural code-smell classifier
 torch==2.14.1
 torch-geometric==2.8.0.post1

@@ -17,7 +17,7 @@ Ground truth is the rule engine the GNN distills (`LegacySmellDetector`), so
 these numbers measure agreement with it on unseen code.
 
 Usage:
-    python eval_gnn.py              # writes .gnn_model/eval_report.json
+    python -m novuspipeline.eval_gnn      # writes <model dir>/eval_report.json
 """
 
 import ast
@@ -29,9 +29,9 @@ import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
-import gnn_model
-import train_gnn
-from code_graph import build_graph_from_code
+from . import gnn_model
+from . import train_gnn
+from .code_graph import build_graph_from_code
 
 LABELS = gnn_model.SMELL_LABELS
 BOOTSTRAP_ROUNDS = 1000

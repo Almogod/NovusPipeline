@@ -284,3 +284,22 @@ validated by the synthetic and contrast suites (all pass).
 - [x] Tests: 84 (stub-worker protocol: crash/restart, hang/timeout, valid /
   API-breaking / hallucinated proposals; LLM pipeline both ways; real stdio
   server with annotations, isError and concurrent calls).
+
+## Phase 8: Public Distribution (IN PROGRESS)
+- [x] Python package `novuspipeline` (`src/` layout, relative imports), console
+  script `novuspipeline [--workspace DIR] [--transport stdio|http]`, `python -m
+  novuspipeline`. Light core install; extras `[gnn]` and `[llm]`.
+- [x] No machine-specific paths: GNN checkpoint (1.2 MB) bundled in the wheel;
+  guideline DB in the user data dir, seeded automatically on first use; LLM
+  defaults to the base model (`NOVUS_LLM_BASE_MODEL`), adapter optional
+  (`NOVUS_LLM_PATH`), worker interpreter auto-detected.
+- [x] Verified from a built wheel in a fresh venv: core install (no torch) serves
+  all 21 tools over stdio, auto-seeds RAG, indexes a project, degrades GNN/LLM
+  features with install hints; `[gnn]` install loads the bundled checkpoint.
+- [x] Tests isolated from the user's data dir; CI matrix (Linux/Windows/macOS x
+  Python 3.11-3.13) and a wheel smoke test; release workflow with PyPI trusted
+  publishing.
+- [ ] Owner decisions before release: confirm the MIT license (placeholder), set
+  up the PyPI trusted publisher, push and tag `v0.1.0`, then register with the
+  MCP Registry (`mcp-publisher init` / `publish`; README carries the
+  `mcp-name` marker).

@@ -25,12 +25,13 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from modernizer import LegacySmellDetector, CodeModernizer, missing_names
-import codebase_context
-import local_llm
-import gnn_model
-from ingest_rag import CHROMA_DIR, COLLECTION_NAME, get_collection, similarity_from_distance as ingest_rag_similarity
-from reporter import ModernizationReporter
+from .modernizer import LegacySmellDetector, CodeModernizer, missing_names
+from . import codebase_context
+from . import local_llm
+from . import gnn_model
+from .ingest_rag import (CHROMA_DIR, COLLECTION_NAME, ensure_seeded, get_collection,
+                         similarity_from_distance as ingest_rag_similarity)
+from .reporter import ModernizationReporter
 
 # ---------------------------------------------------------------------------
 # Server Initialization
@@ -171,40 +172,35 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
     try:
         n_results = max(1, min(n_results, 10))
 
-        if os.path.exists(CHROMA_DIR):
-            try:
-                collection = get_collection()
-                if collection is None:
-                    raise LookupError("collection missing")
+        try:
+            collection = ensure_seeded()
+            where_filter = {"category": {"$eq": category.strip()}} if category.strip() else None
+            results = collection.query(
+                query_texts=[f"{query} {expand_query(query)}"],
+                n_results=n_results,
+                where=where_filter,
+                include=["documents", "metadatas", "distances"]
+            )
 
-                where_filter = {"category": {"$eq": category.strip()}} if category.strip() else None
+            docs = results.get("documents", [[]])[0]
+            metas = results.get("metadatas", [[]])[0]
+            dists = results.get("distances", [[]])[0]
 
-                results = collection.query(
-                    query_texts=[f"{query} {expand_query(query)}"],
-                    n_results=n_results,
-                    where=where_filter,
-                    include=["documents", "metadatas", "distances"]
-                )
+            if docs:
+                header = f"## RAG Guidelines - Query: `{query}`"
+                if category.strip():
+                    header += f" | Category: `{category.strip()}`"
+                sections = []
+                for doc, meta, dist in zip(docs, metas, dists):
+                    score = round(ingest_rag_similarity(dist), 3) if dist is not None else 0.0
+                    title = meta.get("title", "Guideline")
+                    cat = meta.get("category", "")
+                    sections.append(f"### [{cat}] {title} (relevance: {score})\n\n{doc}")
+                return header + "\n\n" + "\n\n---\n\n".join(sections)
+        except Exception:
+            pass  # vector store unavailable: fall through to the built-in rules
 
-                docs = results.get("documents", [[]])[0]
-                metas = results.get("metadatas", [[]])[0]
-                dists = results.get("distances", [[]])[0]
-
-                if docs:
-                    header = f"## RAG Guidelines - Query: `{query}`"
-                    if category.strip():
-                        header += f" | Category: `{category.strip()}`"
-                    sections = []
-                    for doc, meta, dist in zip(docs, metas, dists):
-                        score = round(ingest_rag_similarity(dist), 3) if dist is not None else 0.0
-                        title = meta.get("title", "Guideline")
-                        cat = meta.get("category", "")
-                        sections.append(f"### [{cat}] {title} (relevance: {score})\n\n{doc}")
-                    return header + "\n\n" + "\n\n---\n\n".join(sections)
-            except Exception:
-                pass
-
-        # Fallback when vector DB is not initialized
+        # Fallback when the vector store cannot be used
         default_rules = [
             "### Novus Rule #1: Explicit Typing & Modern Constructs",
             "- Always add type hints (Python 3.10+ syntax / TypeScript strict mode).",
@@ -235,9 +231,7 @@ def search_rag_by_id(document_id: str) -> str:
         if not document_id.strip():
             return "Error: document_id cannot be empty."
 
-        collection = get_collection() if os.path.exists(CHROMA_DIR) else None
-        if collection is None:
-            return "Error: RAG database is not initialized. Run ingest_rag.py first."
+        collection = ensure_seeded()
 
         res = collection.get(ids=[document_id.strip()], include=["documents", "metadatas"])
         docs = res.get("documents", [])
@@ -263,13 +257,8 @@ def get_rag_stats() -> str:
     """
     try:
         chroma_dir = CHROMA_DIR
-        if not os.path.exists(chroma_dir):
-            return "RAG Status: Database not initialized at '.chroma_db'."
-
         try:
-            collection = get_collection()
-            if collection is None:
-                raise LookupError("collection does not exist; run ingest_rag.py")
+            collection = ensure_seeded()
             count = collection.count()
             all_res = collection.get(include=["metadatas"])
             metas = all_res.get("metadatas", [])
@@ -332,7 +321,7 @@ def reset_rag_database() -> str:
     Programmatically resets and re-seeds the local RAG database with core enterprise guidelines.
     """
     try:
-        from ingest_rag import seed_rag_database
+        from .ingest_rag import seed_rag_database
         seed_rag_database(reset=True)
         return "Successfully reset and re-seeded the RAG vector database."
     except Exception as e:
@@ -549,24 +538,25 @@ def get_local_llm_status(probe: bool = False) -> str:
     """
     try:
         info = local_llm.get_model_info(probe=probe)
-        if not info["exists"]:
-            status_str = "Adapter path not found"
+        if info["adapter_path"] and not info["adapter_found"]:
+            status_str = f"Adapter not found at NOVUS_LLM_PATH ({info['adapter_path']})"
         elif info.get("load_error"):
             status_str = f"Load failed: {info['load_error']}"
         elif probe:
             status_str = "Loaded and ready"
         elif info["worker_python"] is None:
-            status_str = "Configured, but no LLM interpreter (.venv-llm / NOVUS_LLM_PYTHON); rule-based fallback in use"
+            status_str = ('No LLM runtime (pip install "novuspipeline[llm]" or set NOVUS_LLM_PYTHON); '
+                          "rule-based fallback in use")
         else:
             status_str = "Configured (loads on first use; call with probe=true to verify)"
+        adapter = (f"`{info['adapter_path']}`" + (f" (LoRA r={info.get('lora_rank')}, alpha={info.get('lora_alpha')})"
+                                                  if info.get("lora_rank") else "")
+                   if info["adapter_path"] else "none (base model only)")
         lines = [
             "## Integrated Local LLM Status\n",
-            f"- **Model Path**: `{info['model_path']}`",
-            f"- **Model Name**: `{info['model_name']}`",
+            f"- **Model**: `{info['model_name']}`",
             f"- **Base Model**: `{info['base_model']}`",
-            f"- **Adapter Config Found**: {info['has_adapter_config']}"
-            + (f" (LoRA r={info.get('lora_rank')}, alpha={info.get('lora_alpha')}, {info.get('training_method')})"
-               if info.get("lora_rank") else ""),
+            f"- **Adapter**: {adapter}",
             f"- **Worker Interpreter**: `{info['worker_python']}` (log: `{info['worker_log']}`)",
             f"- **Status**: {status_str}",
         ]
@@ -637,7 +627,7 @@ def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> 
 
         return (
             f"## LLM Modernization Proposal for `{file_path}`\n"
-            f"**Model**: `unsloth_Qwen3.5-2B_1785882774`\n\n"
+            f"**Model**: `{local_llm.model_name()}`\n\n"
             f"### Retrieved Guidelines\n{rag_guidelines}\n\n"
             + (f"{context_md}\n\n" if context_md else "")
             + "### Proposal\n" + "\n".join(details) + "\n\n"
@@ -1241,7 +1231,34 @@ def modernization_workflow(file_path: str = "") -> str:
     )
 
 
+def main(argv: Optional[List[str]] = None) -> None:
+    """Console entry point: `novuspipeline [--workspace DIR] [--transport stdio|http]`."""
+    import argparse
+    from . import __version__
+
+    global WORKSPACE_ROOT
+    parser = argparse.ArgumentParser(prog="novuspipeline", description="NovusPipeline MCP server")
+    parser.add_argument("--workspace", help="codebase to modernize (default: NOVUS_WORKSPACE_ROOT or current directory)")
+    parser.add_argument("--transport", choices=["stdio", "http"], default="stdio",
+                        help="stdio for MCP clients that launch the server (default); http to serve over the network")
+    parser.add_argument("--host", default="127.0.0.1", help="http only; the server has no authentication, so keep it local")
+    parser.add_argument("--port", type=int, default=8000, help="http only")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = parser.parse_args(argv)
+
+    if args.workspace:
+        WORKSPACE_ROOT = os.path.abspath(args.workspace)
+    if not os.path.isdir(WORKSPACE_ROOT):
+        parser.error(f"workspace '{WORKSPACE_ROOT}' is not a directory")
+
+    if args.transport == "http":
+        if args.host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"WARNING: serving on {args.host} without authentication; anyone who can reach it can read "
+                  f"and modify {WORKSPACE_ROOT}.", file=sys.stderr)
+        mcp.run(transport="http", host=args.host, port=args.port, show_banner=False, log_level="CRITICAL")
+    else:
+        mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
+
+
 if __name__ == "__main__":
-    os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
-    os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
-    mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
+    main()
