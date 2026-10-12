@@ -60,7 +60,7 @@ jobs:
           python -m venv /tmp/fresh
           /tmp/fresh/bin/pip install dist/*.whl
           /tmp/fresh/bin/novuspipeline --version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
