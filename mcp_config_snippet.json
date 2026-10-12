@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "novuspipeline": {
-      "command": "uvx",
-      "args": ["--from", "novuspipeline[gnn]", "novuspipeline", "--workspace", "/absolute/path/to/your/project"]
-    }
-  }
-}
