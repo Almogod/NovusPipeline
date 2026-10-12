@@ -1,0 +1,67 @@
+# Example pack: code that must run on Python 3.12+.
+# Install with the `install_standard_pack` tool; edit the copy in .novus/standards/.
+
+[pack]
+name = "python-312-ready"
+description = "Modules and APIs removed or deprecated in Python 3.12"
+
+[[rule]]
+id = "PY312-DISTUTILS"
+title = "distutils was removed in Python 3.12"
+severity = "HIGH"
+imports = ["distutils"]
+guideline = """
+`distutils` was removed in Python 3.12 (PEP 632). Use `setuptools` for building,
+`packaging.version` for version parsing, and `shutil` / `sysconfig` for the utilities.
+"""
+
+[[rule]]
+id = "PY312-IMP"
+title = "imp was removed in Python 3.12"
+severity = "HIGH"
+imports = ["imp"]
+guideline = """
+The `imp` module was removed in Python 3.12. Use `importlib` (`importlib.import_module`,
+`importlib.util.spec_from_file_location`, `importlib.reload`).
+"""
+
+[[rule]]
+id = "PY312-ASYNCORE"
+title = "asyncore, asynchat and smtpd were removed in Python 3.12"
+severity = "HIGH"
+imports = ["asyncore", "asynchat", "smtpd"]
+guideline = """
+`asyncore`, `asynchat` and `smtpd` were removed in Python 3.12. Use `asyncio`
+(and `aiosmtpd` for SMTP servers).
+"""
+
+[[rule]]
+id = "PY312-SAFECONFIGPARSER"
+title = "configparser.SafeConfigParser was removed in Python 3.12"
+severity = "HIGH"
+calls = ["configparser.SafeConfigParser"]
+replace_call = "configparser.ConfigParser"
+guideline = """
+`SafeConfigParser` has been an alias of `ConfigParser` since Python 3.2 and was removed
+in 3.12. The automatic fix renames it.
+"""
+
+[[rule]]
+id = "PY312-SSL-WRAP-SOCKET"
+title = "ssl.wrap_socket was removed in Python 3.12"
+severity = "HIGH"
+calls = ["ssl.wrap_socket"]
+guideline = """
+`ssl.wrap_socket` was removed in Python 3.12. Create a context with
+`ssl.create_default_context()` and call `context.wrap_socket(sock, server_hostname=...)`.
+"""
+
+[[rule]]
+id = "PY312-UTCNOW"
+title = "datetime.utcnow() is deprecated"
+severity = "MEDIUM"
+calls = ["datetime.datetime.utcnow", "datetime.datetime.utcfromtimestamp"]
+guideline = """
+`datetime.utcnow()` and `utcfromtimestamp()` are deprecated since Python 3.12 and return
+naive datetimes. Use `datetime.now(timezone.utc)` / `datetime.fromtimestamp(ts, timezone.utc)`.
+"""

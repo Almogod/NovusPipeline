@@ -5,28 +5,34 @@ build-backend = "hatchling.build"
 [project]
 name = "novuspipeline"
 dynamic = ["version"]
-description = "Codebase-aware legacy code modernization MCP server: rule engine + structural GNN + RAG + test-gated git PRs"
+description = "Codebase-aware legacy code migration MCP server: your standards, Ruff, a structural GNN and git-history learning, with sandboxed test-gated commits"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Almogod" }]
 requires-python = ">=3.11"
-keywords = ["mcp", "model-context-protocol", "refactoring", "modernization", "legacy-code", "gnn"]
+keywords = ["mcp", "model-context-protocol", "refactoring", "modernization", "migration", "legacy-code", "code-quality", "gnn", "ruff"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Version Control :: Git",
 ]
 dependencies = [
     "fastmcp>=4.0,<5",
     "chromadb>=1.5,<2",
-    "GitPython>=3.1",
-    "pydantic>=2",
+    "GitPython>=3.1,<4",
+    "pydantic>=2,<3",
     "platformdirs>=4",
+    "ruff>=0.6",
 ]
 
 [project.optional-dependencies]
@@ -43,7 +49,10 @@ novuspipeline = "novuspipeline.server:main"
 
 [project.urls]
 Homepage = "https://github.com/Almogod/NovusPipeline"
+Documentation = "https://github.com/Almogod/NovusPipeline#readme"
+Changelog = "https://github.com/Almogod/NovusPipeline/blob/main/CHANGELOG.md"
 Issues = "https://github.com/Almogod/NovusPipeline/issues"
+Source = "https://github.com/Almogod/NovusPipeline"
 
 [tool.hatch.version]
 path = "src/novuspipeline/__init__.py"
@@ -52,4 +61,23 @@ path = "src/novuspipeline/__init__.py"
 packages = ["src/novuspipeline"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/novuspipeline", "tests", "README.md", "LICENSE", "phases.md", "architecture.md", "rules.md"]
+include = ["src/novuspipeline", "tests", "docs", "README.md", "CHANGELOG.md", "SECURITY.md", "CONTRIBUTING.md", "LICENSE"]
+
+[dependency-groups]
+dev = ["build>=1.2", "twine>=5", "ruff>=0.6"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4", "PIE", "RUF"]
+ignore = [
+    "E402",   # tests set NOVUS_* environment variables before importing the server
+    "B905",   # zip(strict=...) on every call adds noise; lengths are checked where they matter
+    "E501",   # long lines in user-facing strings and tables; formatting is reviewed, not enforced
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["novuspipeline"]

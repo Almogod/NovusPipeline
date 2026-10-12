@@ -8,7 +8,6 @@ and GitHub/GitLab pull request markdown artifacts.
 import os
 import re
 import time
-from typing import Dict, Any, List
 
 
 class ModernizationReporter:
@@ -31,11 +30,11 @@ class ModernizationReporter:
 
         report = f"""# 🚀 NovusPipeline Codebase Modernization Report
 
-**Target File**: `{file_path}`  
-**Git Branch**: `{branch_name}`  
-**Generated At**: `{timestamp}`  
-**LLM Engine**: `{model_used}`  
-**RAG Store**: `ChromaDB guideline store (user data dir)`  
+- **Target File**: `{file_path}`
+- **Git Branch**: `{branch_name}`
+- **Generated At**: `{timestamp}`
+- **LLM Engine**: `{model_used}`
+- **RAG Store**: `ChromaDB guideline store (user data dir)`
 
 ---
 

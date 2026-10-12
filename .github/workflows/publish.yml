@@ -1,11 +1,15 @@
-# Publishes to PyPI when a GitHub release is published (tag e.g. v0.1.0).
+# Publishes to PyPI when a GitHub release is published (tag vX.Y.Z matching __version__).
 # One-time setup: on pypi.org add a "trusted publisher" for this repository with
-# workflow "publish.yml" and environment "pypi". No API token is stored here.
+# workflow "publish.yml" and environment "pypi". No API token is stored here;
+# PyPI attaches build attestations automatically.
 name: Publish
 
 on:
   release:
     types: [published]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -15,8 +19,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - run: pip install build
+      - name: Check that the release tag matches the package version
+        run: |
+          version=$(python -c "import re; print(re.search(r'__version__ = \"(.+?)\"', open('src/novuspipeline/__init__.py').read()).group(1))")
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "Release tag ${GITHUB_REF_NAME} does not match package version v${version}" >&2
+            exit 1
+          fi
+      - run: pip install build twine
       - run: python -m build
+      - run: twine check --strict dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: dist

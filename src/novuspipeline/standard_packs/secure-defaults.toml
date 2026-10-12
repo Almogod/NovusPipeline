@@ -1,0 +1,59 @@
+# Example pack: secure defaults for Python services.
+# Install into a project with the `install_standard_pack` tool (it is copied to
+# .novus/standards/, where your team can edit it). Rule fields are documented in
+# novuspipeline/standards.py and the README ("Modernization standards").
+
+[pack]
+name = "secure-defaults"
+description = "HTTP timeouts, safe YAML loading, TLS verification, no shell=True"
+
+# These rules supersede Ruff's equivalents (and add fixes), so Ruff stops reporting them twice.
+[ruff]
+ignore = ["S113", "S506", "S501", "S602"]
+
+[[rule]]
+id = "SEC-TIMEOUT"
+title = "HTTP requests must set a timeout"
+severity = "MEDIUM"
+calls = ["requests.get", "requests.post", "requests.put", "requests.patch", "requests.delete",
+         "requests.head", "requests.options", "requests.request"]
+require_keyword = "timeout"
+add_keyword = "timeout=30"
+guideline = """
+Without `timeout=`, `requests` waits forever on a stalled server and ties up a worker.
+Always pass an explicit timeout (seconds, or a `(connect, read)` tuple). The automatic fix
+adds `timeout=30`; adjust it where a different budget is required.
+"""
+
+[[rule]]
+id = "SEC-YAML-LOAD"
+title = "Load YAML with yaml.safe_load"
+severity = "HIGH"
+calls = ["yaml.load"]
+require_keyword = "Loader"
+replace_call = "yaml.safe_load"
+guideline = """
+`yaml.load` without an explicit `Loader` can construct arbitrary Python objects from
+untrusted input. Use `yaml.safe_load` (or pass `Loader=yaml.SafeLoader`).
+"""
+
+[[rule]]
+id = "SEC-TLS-VERIFY"
+title = "Never disable TLS certificate verification"
+severity = "HIGH"
+enforce = "block"
+pattern = '\bverify\s*=\s*False\b'
+guideline = """
+`verify=False` accepts any certificate, so connections can be intercepted. Point
+`verify=` at your CA bundle instead (e.g. an internal CA path) or fix the server certificate.
+"""
+
+[[rule]]
+id = "SEC-SHELL"
+title = "Do not run subprocesses through the shell"
+severity = "HIGH"
+pattern = '\bshell\s*=\s*True\b'
+guideline = """
+`shell=True` passes the command through the system shell, so any interpolated value can
+inject commands. Pass an argument list (`subprocess.run(["git", "status"])`) instead.
+"""

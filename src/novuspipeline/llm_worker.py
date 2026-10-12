@@ -136,6 +136,7 @@ def generate(messages: list, max_new_tokens: int = 512, adapter: bool = True) ->
     if _state["model"] is None:
         raise RuntimeError(f"model not loaded: {_state['load_error']}")
     import contextlib
+
     import torch
 
     model, tokenizer = _state["model"], _state["tokenizer"]

@@ -25,7 +25,7 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from . import local_llm
 from .modernizer import CodeModernizer, LegacySmellDetector, top_level_names
@@ -39,7 +39,7 @@ GUIDELINES = (
     "- Convert Python 2 print statements to print()."
 )
 
-CASES: List[Dict[str, Any]] = [
+CASES: list[dict[str, Any]] = [
     {"name": "bare_except_parse", "probes": ["to_int('5')", "to_int('x')", "to_int(None)", "to_int('7', 3)"],
      "code": "def to_int(s, default=0):\n    try:\n        return int(s)\n    except:\n        return default\n"},
     {"name": "untyped_math", "probes": ["mean([1, 2, 3])", "mean([])", "clamp(5, 0, 3)", "clamp(-1, 0, 3)"],
@@ -85,7 +85,7 @@ print(json.dumps([run(src_a), run(src_b)]))
 """
 
 
-def parity(original: str, candidate: Optional[str], probes: List[str]) -> Optional[float]:
+def parity(original: str, candidate: str | None, probes: list[str]) -> float | None:
     """Share of probe calls with identical results; None if the case has no probes."""
     if not probes:
         return None
@@ -101,7 +101,7 @@ def parity(original: str, candidate: Optional[str], probes: List[str]) -> Option
     return sum(x == y for x, y in zip(a, b)) / len(probes)
 
 
-def score(case: Dict[str, Any], proposal: Dict[str, Any]) -> Dict[str, Any]:
+def score(case: dict[str, Any], proposal: dict[str, Any]) -> dict[str, Any]:
     code = proposal["code"]
     before = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(case["code"], "x.py"))
     after = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(code, "x.py")) if code else before
@@ -127,11 +127,11 @@ def main() -> None:
         sys.exit(f"LLM worker could not load the model: {info['load_error']}")
     print(f"[eval_llm] worker: {info.get('worker')}", file=sys.stderr)
 
-    results: Dict[str, Any] = {"model": info, "cases": []}
+    results: dict[str, Any] = {"model": info, "cases": []}
     for case in CASES:
         required = sorted(n for n in (top_level_names(case["code"], include_imports=False) or set())
                           if not n.startswith("_"))
-        row: Dict[str, Any] = {"name": case["name"]}
+        row: dict[str, Any] = {"name": case["name"]}
         outputs = {}
         for engine, adapter in (("adapter", True), ("base", False)):
             t = time.perf_counter()
@@ -150,15 +150,17 @@ def main() -> None:
         row["outputs"] = outputs
         results["cases"].append(row)
 
+    def mean(rows: list, key: str) -> float:
+        return round(sum(r[key] for r in rows if r[key] is not None) /
+                     max(1, sum(r[key] is not None for r in rows)), 3)
+
     summary = {}
     for engine in ("adapter", "base", "rule_based"):
         rows = [c[engine] for c in results["cases"]]
-        mean = lambda key: round(sum(r[key] for r in rows if r[key] is not None) /
-                                 max(1, sum(r[key] is not None for r in rows)), 3)
-        summary[engine] = {"parses": mean("parses"), "valid": mean("valid"), "resolved": mean("resolved"),
-                           "api_kept": mean("api_kept"), "parity": mean("parity")}
+        summary[engine] = {"parses": mean(rows, "parses"), "valid": mean(rows, "valid"), "resolved": mean(rows, "resolved"),
+                           "api_kept": mean(rows, "api_kept"), "parity": mean(rows, "parity")}
         if engine != "rule_based":
-            summary[engine]["tokens_per_second"] = mean("tokens_per_second")
+            summary[engine]["tokens_per_second"] = mean(rows, "tokens_per_second")
     summary["adapter_changes_output_in"] = f"{sum(c['adapter_output_differs_from_base'] for c in results['cases'])}/{len(CASES)} cases"
     results["summary"] = summary
 

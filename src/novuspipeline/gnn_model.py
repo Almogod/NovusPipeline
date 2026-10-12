@@ -19,7 +19,7 @@ import json
 import os
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from .code_graph import (
     FIELD_NAMES,
@@ -31,7 +31,7 @@ from .code_graph import (
 
 # PY-SMELL-001 (Python 2 `print x`) is excluded: it is invalid Python 3, so it
 # can never appear in an ast.parse()-able graph.
-SMELL_LABELS: List[str] = [
+SMELL_LABELS: list[str] = [
     "PY-SMELL-002",  # Obsolete urllib/urllib2 import
     "PY-SMELL-003",  # Bare except clause
     "PY-SMELL-004",  # Deprecated os.popen
@@ -59,8 +59,8 @@ CHECKPOINT_PATH = os.path.join(_MODEL_DIR, "smell_gnn.pt")
 METADATA_PATH = os.path.join(_MODEL_DIR, "metadata.json")
 
 _MODEL = None
-_MODEL_MTIME: Optional[float] = None
-_LOAD_ERROR: Optional[str] = None
+_MODEL_MTIME: float | None = None
+_LOAD_ERROR: str | None = None
 
 
 def _require_torch():
@@ -72,10 +72,10 @@ def _require_torch():
         raise RuntimeError(
             'GNN features need the optional extra: pip install "novuspipeline[gnn]" '
             f"(torch + torch_geometric). Import error: {e}"
-        )
+        ) from e
 
 
-def build_model(config: Optional[GNNConfig] = None):
+def build_model(config: GNNConfig | None = None):
     """Constructs a fresh, untrained SmellGNN for `config`."""
     config = config or GNNConfig()
     torch = _require_torch()
@@ -141,7 +141,7 @@ def build_model(config: Optional[GNNConfig] = None):
     return SmellGNN()
 
 
-def graph_dict_to_pyg_data(graph: Dict[str, Any], y: Optional[List[float]] = None):
+def graph_dict_to_pyg_data(graph: dict[str, Any], y: list[float] | None = None):
     """Converts the plain-dict graph from code_graph.py into a PyG Data object."""
     torch = _require_torch()
     from torch_geometric.data import Data
@@ -159,23 +159,23 @@ def graph_dict_to_pyg_data(graph: Dict[str, Any], y: Optional[List[float]] = Non
     return data
 
 
-def _read_metadata() -> Dict[str, Any]:
+def _read_metadata() -> dict[str, Any]:
     if not os.path.exists(METADATA_PATH):
         return {}
     try:
-        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+        with open(METADATA_PATH, encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
-def get_thresholds() -> Dict[str, float]:
+def get_thresholds() -> dict[str, float]:
     """Per-label decision thresholds calibrated on the validation split at training time."""
     saved = _read_metadata().get("thresholds") or {}
     return {label: float(saved.get(label, 0.5)) for label in SMELL_LABELS}
 
 
-def get_gnn_status() -> Dict[str, Any]:
+def get_gnn_status() -> dict[str, Any]:
     """Returns checkpoint/metadata status without requiring torch to be importable."""
     try:
         _require_torch()
@@ -194,7 +194,7 @@ def get_gnn_status() -> Dict[str, Any]:
     }
 
 
-def _member_paths() -> List[str]:
+def _member_paths() -> list[str]:
     members = _read_metadata().get("members") or [os.path.basename(CHECKPOINT_PATH)]
     return [os.path.join(_MODEL_DIR, m) for m in members]
 
@@ -252,7 +252,7 @@ def _run(code: str, encode_only: bool):
         return _probs_and_embedding(members, data, batch)[0]
 
 
-def predict_smells(code: str) -> Dict[str, float]:
+def predict_smells(code: str) -> dict[str, float]:
     """
     Returns {smell_id: probability}. Compare against `get_thresholds()`, not 0.5.
 
@@ -263,12 +263,12 @@ def predict_smells(code: str) -> Dict[str, float]:
     return dict(zip(SMELL_LABELS, probs))
 
 
-def encode_graph(code: str) -> List[float]:
+def encode_graph(code: str) -> list[float]:
     """Pooled graph embedding (2 * hidden_dim floats), for downstream fusion models."""
     return _run(code, encode_only=True).squeeze(0).tolist()
 
 
-def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[str, Any]]]:
+def analyze_many(codes: list[str], batch_size: int = 64) -> list[dict[str, Any] | None]:
     """
     Batched smell probabilities + graph embeddings, one forward pass per batch.
     Returns, per input, {"probs": {smell_id: p}, "embedding": [...]}, or None if
@@ -281,14 +281,14 @@ def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[s
     torch = _require_torch()
     from torch_geometric.data import Batch
 
-    graphs: List[Any] = []
+    graphs: list[Any] = []
     for code in codes:
         try:
             graphs.append(graph_dict_to_pyg_data(build_graph_from_code(code)))
         except (SyntaxError, ValueError):
             graphs.append(None)
 
-    results: List[Optional[Dict[str, Any]]] = [None] * len(codes)
+    results: list[dict[str, Any] | None] = [None] * len(codes)
     valid = [i for i, g in enumerate(graphs) if g is not None]
     with torch.no_grad():
         for start in range(0, len(valid), batch_size):
@@ -303,7 +303,7 @@ def analyze_many(codes: List[str], batch_size: int = 64) -> List[Optional[Dict[s
     return results
 
 
-def save_checkpoint(models, config: GNNConfig, thresholds: Dict[str, float], metrics: Dict[str, Any]) -> None:
+def save_checkpoint(models, config: GNNConfig, thresholds: dict[str, float], metrics: dict[str, Any]) -> None:
     """Saves one model or an ensemble (list). Member 0 is always `smell_gnn.pt`."""
     torch = _require_torch()
     models = models if isinstance(models, list) else [models]

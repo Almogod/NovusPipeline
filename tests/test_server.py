@@ -8,6 +8,7 @@ import unittest
 from unittest import mock
 
 os.environ.setdefault("NOVUS_FAST_TEST", "1")  # never load the multi-GB local LLM in tests
+os.environ.setdefault("NOVUS_LEARN_FROM_HISTORY", "0")  # learner tests mine explicitly, not in the background
 # Keep the guideline DB out of the user's real data directory (read at import time).
 os.environ.setdefault("NOVUS_DATA_DIR", tempfile.mkdtemp(prefix="novus-test-data-"))
 
@@ -83,7 +84,7 @@ class WorkspaceTestCase(unittest.TestCase):
         return path
 
     def read(self, rel: str) -> str:
-        with open(os.path.join(self.root, rel), "r", encoding="utf-8") as f:
+        with open(os.path.join(self.root, rel), encoding="utf-8") as f:
             return f.read()
 
     def commit_all(self, message: str = "fixture") -> None:
@@ -157,8 +158,9 @@ class TestRag(unittest.TestCase):
         self.assertIn("Successfully ingested", res)
 
     def test_ingest_rag_document_invalid_category(self):
-        res = ingest_rag_document("test-doc-unit-002", "Test Rule", "ruby", "Some content.")
-        self.assertIn("category", res)
+        # Custom categories (e.g. an industry) are allowed; they must be simple slugs.
+        res = ingest_rag_document("test-doc-unit-002", "Test Rule", "Ruby Lang!", "Some content.")
+        self.assertIn("category must be a lowercase slug", res)
 
     def test_reset_rag_database_keeps_stdout_clean(self):
         # Under MCP stdio, stdout is the JSON-RPC channel; progress must go to stderr.
@@ -249,7 +251,7 @@ class TestCodeModernizer(unittest.TestCase):
     )
 
     def test_modernize_python_is_behavior_preserving(self):
-        out, notes = CodeModernizer.modernize_python(self.LEGACY)
+        out, _notes = CodeModernizer.modernize_python(self.LEGACY)
         self.assertIn("import urllib.request", out)
         self.assertIn("urllib.request.urlopen(url)", out)
         self.assertIn("except urllib.error.HTTPError as e:", out)
@@ -319,7 +321,7 @@ class TestGitTools(WorkspaceTestCase):
         self.assertIn("Created and checked out new branch", res)
         self.assertEqual(self.repo.active_branch.name, "test-modernization-branch")
         self.assertIn("a.py", self.committed_files())
-        self.assertTrue(os.path.exists(os.path.join(self.root, ".novus_pr_test-modernization-branch.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.root, ".novus_index", "prs", "test-modernization-branch.md")))
 
     def test_invalid_branch_names_rejected(self):
         for name in ("../evil", "bad..name", "has space"):
@@ -351,7 +353,7 @@ class TestGitTools(WorkspaceTestCase):
         res = finalize_git_migration_pr("feature/final", "main", 'Fix "quoted" title', "Summary.")
         self.assertIn("NovusPipeline Git PR Finalization", res)
         self.assertIn("gh pr create --title 'Fix \"quoted\" title'", res)
-        self.assertTrue(os.path.exists(os.path.join(self.root, ".novus_pr_feature_final.md")))
+        self.assertTrue(os.path.exists(os.path.join(self.root, ".novus_index", "prs", "feature_final.md")))
 
 
 # ---------------------------------------------------------------------------
@@ -373,7 +375,7 @@ class TestModernizationTools(WorkspaceTestCase):
     def test_analyze_runs_gnn_cross_check_even_without_rule_findings(self):
         self.write("clean.py", "def add(a: int, b: int) -> int:\n    return a + b\n")
         report = analyze_legacy_codebase("clean.py")
-        self.assertIn("No rule-based legacy code smells", report)
+        self.assertIn("No legacy code smells detected", report)
         self.assertIn("Structural GNN Cross-Check", report)
 
     def test_analyze_legacy_codebase_survives_gnn_failure(self):
@@ -433,7 +435,11 @@ class TestAutonomousPipeline(WorkspaceTestCase):
         res = run_autonomous_modernization_pipeline("calc.py", branch_name="test-auto-pipeline-branch")
         self.assertIn("Completed Successfully", res, res)
         self.assertIn("test_calc", res)  # related test selected from the import graph
-        self.assertEqual(self.committed_files(), {"calc.py"})
+        self.assertEqual(self.committed_files("test-auto-pipeline-branch"), {"calc.py"})
+        self.assertIn("import urllib.request", self.repo.git.show("test-auto-pipeline-branch:calc.py"))
+        self.assertEqual(self.repo.active_branch.name, "main")  # working copy and branch untouched
+        self.assertEqual(self.read("calc.py"), LEGACY_MODULE)
+        self.assertEqual(len(self.repo.git.worktree("list").splitlines()), 1)  # temp worktree removed
         self.assertIn("other_legacy.py", res)  # same smell elsewhere -> follow-up candidate
         self.assertFalse(os.path.exists(os.path.join(self.root, "calc.py.bak")))
 
@@ -476,7 +482,8 @@ class TestCodebaseContext(WorkspaceTestCase):
         self.assertNotIn(".venv/lib/ignored.py", self.index.files)
         rec = self.index.files["broken_py2.py"]
         self.assertIsNotNone(rec["parse_error"])
-        self.assertEqual([f["smell_id"] for f in rec["rule_findings"]], ["PY-SMELL-001"])
+        self.assertEqual([f["smell_id"] for f in rec["rule_findings"] if f["source"] == "rules"], ["PY-SMELL-001"])
+        self.assertIn("RUFF-SYNTAX", {f["smell_id"] for f in rec["rule_findings"]})  # not valid Python 3
 
     def test_import_graph_resolves_relative_and_aliased_imports(self):
         self.assertEqual(self.index.dependents("pkg/core.py"),
@@ -666,15 +673,16 @@ class TestPipelineWithLlm(WorkspaceTestCase, StubWorkerTestCase):
         res = run_autonomous_modernization_pipeline("calc.py", use_llm=True, branch_name="llm-branch")
         self.assertIn("Completed Successfully", res, res)
         self.assertIn("(validated; resolved PY-SMELL-003, PY-SMELL-006)", res)
-        self.assertIn("except (TypeError, ValueError):", self.read("calc.py"))
+        self.assertIn("except (TypeError, ValueError):", self.repo.git.show("llm-branch:calc.py"))
+        self.assertIn("except:", self.read("calc.py"))  # working copy untouched
 
     def test_api_breaking_llm_proposal_falls_back_to_rules(self):
         self.reply("```python\ndef parse(s: str) -> int:\n    return int(s)\n```")
         res = run_autonomous_modernization_pipeline("calc.py", use_llm=True, branch_name="llm-branch")
         self.assertIn("LLM proposal not used", res)
         self.assertIn("to_int", res)
-        self.assertIn("def to_int(", self.read("calc.py"))
-        self.assertIn("except Exception:", self.read("calc.py"))
+        self.assertIn("def to_int(", self.repo.git.show("llm-branch:calc.py"))
+        self.assertIn("except Exception:", self.repo.git.show("llm-branch:calc.py"))
 
 
 # ---------------------------------------------------------------------------
@@ -685,6 +693,7 @@ class TestMcpProtocol(WorkspaceTestCase):
 
     def test_server_over_stdio(self):
         import asyncio
+
         from fastmcp import Client
         from fastmcp.client.transports import StdioTransport
         from fastmcp.exceptions import ToolError
@@ -698,9 +707,12 @@ class TestMcpProtocol(WorkspaceTestCase):
             transport = StdioTransport(command=sys.executable, args=["-m", "novuspipeline"], cwd=repo, env=env)
             async with Client(transport) as client:
                 tools = {t.name: t for t in await client.list_tools()}
-                self.assertEqual(len(tools), 21)
+                self.assertEqual(len(tools), 27)
                 self.assertTrue(tools["get_file_context"].annotations.read_only_hint)
-                self.assertTrue(tools["run_autonomous_modernization_pipeline"].annotations.destructive_hint)
+                # The pipeline works in a disposable worktree (only adds a branch); direct edits are destructive.
+                self.assertFalse(tools["run_autonomous_modernization_pipeline"].annotations.destructive_hint)
+                self.assertFalse(tools["run_autonomous_modernization_pipeline"].annotations.read_only_hint)
+                self.assertTrue(tools["apply_code_modernization"].annotations.destructive_hint)
                 self.assertIn("files", tools["create_git_migration_pr"].input_schema["properties"])
                 self.assertIn("use_llm", tools["run_autonomous_modernization_pipeline"].input_schema["properties"])
 
@@ -774,7 +786,7 @@ class TestGnn(unittest.TestCase):
         self.assertIn("Torch Available", res)
 
     def test_analyze_code_structure_gnn_rejects_non_python(self):
-        self.assertIn("Python", analyze_code_structure_gnn("rules.md"))
+        self.assertIn("Python", analyze_code_structure_gnn("README.md"))
 
     @unittest.skipUnless(gnn_ready(), "GNN checkpoint not trained in this environment")
     def test_gnn_separates_smell_from_structural_lookalike(self):

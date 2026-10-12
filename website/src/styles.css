@@ -1,0 +1,241 @@
+@import "tailwindcss";
+@import "@fontsource-variable/archivo/wdth.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/400-italic.css";
+
+/*
+  Color is semantic on this page:
+  sodium  = legacy code, smells, things that need attention
+  glacier = modernized, verified, safe
+  Neither is used as decoration.
+*/
+@theme {
+  --color-midnight: #070b17;
+  --color-hull: #0d1322;
+  --color-hull-2: #141b2e;
+  --color-rule: #1f2840;
+  --color-paper: #e8ecf4;
+  --color-fog: #8c96ab;
+  --color-sodium: #ffa53d;
+  --color-glacier: #8bd3ff;
+  --color-block: #ff7a7a;
+
+  --font-sans: "Archivo Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* Type scale (after Bringhurst): 13 / 14 / 16 / 18 / 21 / 28 / 36 / 48 */
+  --text-label: 0.8125rem;
+  --text-label--line-height: 1.45;
+  --text-lead: 1.125rem;
+  --text-lead--line-height: 1.6;
+  --text-h3: 1.3125rem;
+  --text-h3--line-height: 1.25;
+  --text-h2: clamp(2rem, 3.6vw, 3rem);
+  --text-h2--line-height: 1.04;
+}
+
+@layer base {
+  html {
+    background: var(--color-midnight);
+    color-scheme: dark;
+    scroll-padding-top: 5rem;
+    /* clip, not hidden: hidden would create a scroll container and break position: sticky */
+    overflow-x: clip;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    font-size: 1rem;
+    line-height: 1.6;
+    background: var(--color-midnight);
+    color: var(--color-paper);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+    overflow-x: clip;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  ::selection {
+    background: rgb(139 211 255 / 0.32);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-glacier);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+}
+
+@layer components {
+  /* Display type: Archivo pushed wide and heavy. */
+  .type-display {
+    font-stretch: 106%;
+    font-weight: 760;
+    letter-spacing: -0.028em;
+  }
+
+  .type-h2 {
+    font-size: var(--text-h2);
+    line-height: var(--text-h2--line-height);
+    font-stretch: 104%;
+    font-weight: 700;
+    letter-spacing: -0.024em;
+  }
+
+  /*
+    The hero headline "modernizes" once on load: each word starts condensed and
+    hairline (old, cramped) and settles wide and heavy. Variable axes only, so the
+    words never reflow onto other lines.
+  */
+  .headline {
+    font-size: clamp(2.1rem, 5.1vw, 4.6rem);
+    line-height: 0.98;
+    letter-spacing: -0.03em;
+    font-variation-settings: "wdth" 106, "wght" 760;
+  }
+
+  .headline .word {
+    display: inline-block;
+    opacity: 0;
+  }
+
+  .headline[data-ready="true"] .word {
+    animation: modernize 1.5s cubic-bezier(0.2, 0.75, 0.1, 1) both;
+    animation-delay: calc(120ms + var(--i) * 85ms);
+  }
+
+  @keyframes modernize {
+    from {
+      font-variation-settings: "wdth" 62, "wght" 140;
+      opacity: 0;
+    }
+    25% {
+      opacity: 1;
+    }
+    to {
+      font-variation-settings: "wdth" 106, "wght" 760;
+      opacity: 1;
+    }
+  }
+
+  /* Soft darkening behind text that sits over the 3D scene. */
+  .scrim {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .scrim::before {
+    content: "";
+    position: absolute;
+    inset: -3rem -1.25rem;
+    z-index: -1;
+    background: radial-gradient(closest-side, rgb(7 11 23 / 0.82), rgb(7 11 23 / 0.55) 55%, transparent);
+    pointer-events: none;
+  }
+
+  @media (min-width: 768px) {
+    .scrim::before {
+      inset: -3rem -4rem;
+    }
+  }
+
+  /* Labels pinned to AST nodes inside the 3D scene (rendered by drei <Html>). */
+  .np-label {
+    display: grid;
+    gap: 3px;
+    transform: translate(14px, -50%);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.25;
+    white-space: nowrap;
+    pointer-events: none;
+    opacity: 0;
+    will-change: opacity;
+    text-shadow:
+      0 0 3px var(--color-midnight),
+      0 0 8px var(--color-midnight),
+      0 0 14px var(--color-midnight);
+  }
+
+  .np-label[data-side="left"] {
+    transform: translate(calc(-100% - 14px), -50%);
+    justify-items: end;
+    text-align: right;
+  }
+
+  .np-label .np-code,
+  .np-label .np-tag {
+    display: grid;
+  }
+
+  .np-label .np-code > *,
+  .np-label .np-tag > * {
+    grid-area: 1 / 1;
+  }
+
+  .np-label .legacy {
+    color: rgb(232 236 244 / 0.86);
+    opacity: calc(1 - var(--heal, 0));
+  }
+
+  .np-label .modern {
+    color: var(--color-glacier);
+    opacity: var(--heal, 0);
+  }
+
+  .np-label .found {
+    color: var(--color-sodium);
+    opacity: calc(var(--found, 0) * (1 - var(--heal, 0)));
+  }
+
+  .np-label .fixed {
+    color: rgb(139 211 255 / 0.75);
+    opacity: var(--heal, 0);
+  }
+
+  .np-label[data-root] .legacy {
+    color: rgb(232 236 244 / 0.6);
+    opacity: 1;
+  }
+
+  @media (max-width: 767px) {
+    .np-label {
+      display: none;
+    }
+  }
+
+  .skip-link {
+    position: fixed;
+    left: 1rem;
+    top: -4rem;
+    z-index: 100;
+    padding: 0.5rem 0.875rem;
+    border-radius: 8px;
+    background: var(--color-paper);
+    color: var(--color-midnight);
+    font-weight: 600;
+  }
+
+  .skip-link:focus {
+    top: 1rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .headline .word,
+  .headline[data-ready="true"] .word {
+    animation: none;
+    opacity: 1;
+  }
+}

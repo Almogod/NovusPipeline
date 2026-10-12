@@ -1,7 +1,7 @@
-import os
-import sys
 import logging
+import os
 import shutil
+import sys
 
 # Ensure all logging is routed strictly to stderr at CRITICAL level BEFORE importing fastmcp
 logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
@@ -14,23 +14,22 @@ logging.root.addHandler(stderr_handler)
 os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
 os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
 
+import contextlib
 import functools
 import re
 import shlex
 import subprocess
 import threading
 from collections import Counter
-from typing import List, Optional, Tuple
+
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from .modernizer import LegacySmellDetector, CodeModernizer, missing_names
-from . import codebase_context
-from . import local_llm
-from . import gnn_model
-from .ingest_rag import (CHROMA_DIR, COLLECTION_NAME, ensure_seeded, get_collection,
-                         similarity_from_distance as ingest_rag_similarity)
+from . import codebase_context, gnn_model, history_learner, local_llm, ruff_backend, sandbox, standards
+from .ingest_rag import CHROMA_DIR, COLLECTION_NAME, ensure_seeded, get_collection
+from .ingest_rag import similarity_from_distance as ingest_rag_similarity
+from .modernizer import CodeModernizer, LegacySmellDetector, missing_names
 from .reporter import ModernizationReporter
 
 # ---------------------------------------------------------------------------
@@ -43,9 +42,9 @@ mcp = FastMCP("NovusPipeline")
 # worker threads, and two concurrent pipeline runs must never interleave git operations.
 _WORKSPACE_LOCK = threading.RLock()
 _TOOL_KINDS = {
-    "read": dict(read_only_hint=True, destructive_hint=False, idempotent_hint=True),
-    "write": dict(read_only_hint=False, destructive_hint=False, idempotent_hint=True),
-    "destructive": dict(read_only_hint=False, destructive_hint=True, idempotent_hint=False),
+    "read": {"read_only_hint": True, "destructive_hint": False, "idempotent_hint": True},
+    "write": {"read_only_hint": False, "destructive_hint": False, "idempotent_hint": True},
+    "destructive": {"read_only_hint": False, "destructive_hint": True, "idempotent_hint": False},
 }
 
 
@@ -151,26 +150,48 @@ def read_legacy_file(file_path: str) -> str:
                 f"exceeding maximum allowed size limit of {MAX_READ_FILE_SIZE_BYTES / (1024*1024):.0f}MB."
             )
 
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+        with open(full_path, encoding="utf-8", errors="replace") as f:
             content = f.read()
         return content
     except Exception as e:
-        return f"Error reading file '{file_path}': {str(e)}"
+        return f"Error reading file '{file_path}': {e!s}"
+
+
+def _standards() -> "standards.Standards":
+    return standards.load(WORKSPACE_ROOT)
+
+
+def _rel(path: str) -> str:
+    full = path if os.path.isabs(path) else os.path.join(WORKSPACE_ROOT, path)
+    return os.path.relpath(full, WORKSPACE_ROOT).replace(os.sep, "/")
+
+
+def _format_standard(rule: dict, score: float | None = None) -> str:
+    relevance = f" (relevance: {round(score, 3)})" if score is not None else ""
+    enforce = "blocks commits" if rule["enforce"] == "block" else "warning"
+    return (f"### [standard: {rule['pack']}] `{rule['id']}` {rule['title']}{relevance}\n"
+            f"_Severity {rule['severity']}, {enforce}; from `{rule['file']}`._\n\n{rule['guideline']}")
 
 
 @_tool("read")
 def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> str:
     """
-    Query the RAG vector database for modernization and clean-code guidelines.
+    Query the guidelines: the RAG vector database (built-in and ingested documents) plus
+    the active modernization standards (rule packs) of this workspace and user.
 
     Args:
         query:     Natural language query or code snippet to match against guidelines.
-        category:  Optional filter - one of 'python', 'typescript', 'security', 'clean_code'.
-                   Leave empty to search across all categories.
+        category:  Optional filter, e.g. 'python', 'typescript', 'security', 'clean_code',
+                   or a custom category used by ingested documents or rule packs.
         n_results: Number of top results to return (default 3, max 10).
     """
     try:
         n_results = max(1, min(n_results, 10))
+        expanded = f"{query} {expand_query(query)}"
+        try:
+            std_hits = _standards().search(expanded, n_results, category.strip().lower())
+        except Exception:
+            std_hits = []
 
         try:
             collection = ensure_seeded()
@@ -186,19 +207,23 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
             metas = results.get("metadatas", [[]])[0]
             dists = results.get("distances", [[]])[0]
 
-            if docs:
+            scored = [(score, _format_standard(rule, score)) for score, rule in std_hits]
+            for doc, meta, dist in zip(docs, metas, dists):
+                score = round(ingest_rag_similarity(dist), 3) if dist is not None else 0.0
+                title = meta.get("title", "Guideline")
+                cat = meta.get("category", "")
+                scored.append((score, f"### [{cat}] {title} (relevance: {score})\n\n{doc}"))
+            if scored:
                 header = f"## RAG Guidelines - Query: `{query}`"
                 if category.strip():
                     header += f" | Category: `{category.strip()}`"
-                sections = []
-                for doc, meta, dist in zip(docs, metas, dists):
-                    score = round(ingest_rag_similarity(dist), 3) if dist is not None else 0.0
-                    title = meta.get("title", "Guideline")
-                    cat = meta.get("category", "")
-                    sections.append(f"### [{cat}] {title} (relevance: {score})\n\n{doc}")
+                sections = [text for _, text in sorted(scored, key=lambda t: -t[0])[:n_results]]
                 return header + "\n\n" + "\n\n---\n\n".join(sections)
         except Exception:
             pass  # vector store unavailable: fall through to the built-in rules
+        if std_hits:
+            return f"## Organization Standards - Query: `{query}`\n\n" + "\n\n---\n\n".join(
+                _format_standard(rule, score) for score, rule in std_hits)
 
         # Fallback when the vector store cannot be used
         default_rules = [
@@ -216,7 +241,7 @@ def query_rag_guidelines(query: str, category: str = "", n_results: int = 3) -> 
         ]
         return f"Query: '{query}'\nMatched Compliance Guidelines (fallback):\n" + "\n".join(default_rules)
     except Exception as e:
-        return f"Error querying RAG guidelines: {str(e)}"
+        return f"Error querying RAG guidelines: {e!s}"
 
 
 @_tool("read")
@@ -225,11 +250,14 @@ def search_rag_by_id(document_id: str) -> str:
     Retrieve a specific modernization guideline document directly by its ID.
 
     Args:
-        document_id: Unique document ID (e.g. 'py-001', 'ts-002', 'sec-001', 'clean-001').
+        document_id: Unique document ID (e.g. 'py-001', 'sec-001') or a standard's rule id.
     """
     try:
         if not document_id.strip():
             return "Error: document_id cannot be empty."
+        rule = _standards().get(document_id.strip())
+        if rule is not None:
+            return _format_standard(rule)
 
         collection = ensure_seeded()
 
@@ -247,7 +275,7 @@ def search_rag_by_id(document_id: str) -> str:
 
         return f"## RAG Guideline `{document_id}`: [{cat}] {title}\n\n{doc}"
     except Exception as e:
-        return f"Error searching RAG document by ID '{document_id}': {str(e)}"
+        return f"Error searching RAG document by ID '{document_id}': {e!s}"
 
 
 @_tool("read")
@@ -265,18 +293,22 @@ def get_rag_stats() -> str:
             categories = Counter(m.get("category", "unknown") for m in metas)
 
             cat_str = "\n".join(f"  - `{cat}`: {num} documents" for cat, num in categories.items())
+            active = _standards()
+            std_str = (f"- **Organization Standards**: {len(active.rules)} rule(s) from {len(active.packs)} pack(s) "
+                       f"(see `list_modernization_standards`)\n")
             return (
                 f"## NovusPipeline RAG Database Overview\n\n"
                 f"- **Status**: Operational\n"
                 f"- **Storage Path**: `{chroma_dir}`\n"
                 f"- **Collection Name**: `{COLLECTION_NAME}`\n"
                 f"- **Total Guidelines**: {count}\n"
-                f"- **Category Breakdown**:\n{cat_str}"
+                f"- **Category Breakdown**:\n{cat_str}\n"
+                + std_str
             )
         except Exception as e:
-            return f"RAG Status: Collection '{COLLECTION_NAME}' error: {str(e)}"
+            return f"RAG Status: Collection '{COLLECTION_NAME}' error: {e!s}"
     except Exception as e:
-        return f"Error fetching RAG stats: {str(e)}"
+        return f"Error fetching RAG stats: {e!s}"
 
 
 @_tool("write")
@@ -287,17 +319,22 @@ def ingest_rag_document(document_id: str, title: str, category: str, content: st
     Args:
         document_id: Unique identifier for this document (e.g. 'py-custom-001').
         title:       Human-readable title for the guideline.
-        category:    Category tag - one of 'python', 'typescript', 'security', 'clean_code'.
+        category:    Category tag: 'python', 'typescript', 'security', 'clean_code', or your own
+                     (e.g. 'fintech', 'healthcare'); lowercase letters, digits, '_' and '-'.
         content:     Full text content of the guideline or document to embed and store.
+
+    Re-ingesting an existing id (including a built-in one such as 'py-002') replaces it, which
+    is how guidelines are modified. Guidelines advise; to detect, fix or block violations,
+    add a rule with `add_modernization_rule`.
     """
     try:
         if not document_id.strip():
             return "Error: document_id cannot be empty."
         if not content.strip():
             return "Error: content cannot be empty."
-        valid_categories = {"python", "typescript", "security", "clean_code"}
-        if category.strip() not in valid_categories:
-            return f"Error: category must be one of {sorted(valid_categories)}. Got: '{category}'."
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,39}", category.strip()):
+            return (f"Error: category must be a lowercase slug (letters, digits, '_', '-'), e.g. 'python' or "
+                    f"'fintech'. Got: '{category}'.")
 
         collection = get_collection(create=True)
         collection.upsert(
@@ -312,7 +349,26 @@ def ingest_rag_document(document_id: str, title: str, category: str, content: st
             f"Content length: {len(content)} characters."
         )
     except Exception as e:
-        return f"Error ingesting document into RAG: {str(e)}"
+        return f"Error ingesting document into RAG: {e!s}"
+
+
+@_tool("destructive")
+def remove_rag_document(document_id: str) -> str:
+    """
+    Deletes one guideline from the RAG vector database (built-in ones come back with
+    `reset_rag_database`). Rules from rule packs are removed with `remove_modernization_rule`.
+
+    Args:
+        document_id: Id of the document to delete (e.g. 'py-custom-001').
+    """
+    try:
+        collection = ensure_seeded()
+        if not collection.get(ids=[document_id.strip()])["ids"]:
+            return f"Error: Document with ID '{document_id}' was not found in the RAG database."
+        collection.delete(ids=[document_id.strip()])
+        return f"Removed document '{document_id}' from the RAG database."
+    except Exception as e:
+        return f"Error removing RAG document: {e}"
 
 
 @_tool("destructive")
@@ -325,7 +381,7 @@ def reset_rag_database() -> str:
         seed_rag_database(reset=True)
         return "Successfully reset and re-seeded the RAG vector database."
     except Exception as e:
-        return f"Error resetting RAG database: {str(e)}"
+        return f"Error resetting RAG database: {e!s}"
 
 
 ALLOWED_TEST_COMMANDS = (
@@ -343,7 +399,7 @@ _SHELL_CHAINING = (";", "&&", "||", "`", "$(")
 _BATCH_METACHARACTERS = set("&|<>^%!\"")
 
 
-def _validate_test_command(args: List[str]) -> Optional[str]:
+def _validate_test_command(args: list[str]) -> str | None:
     """Error message if `args` is not an allowed test-runner invocation, else None."""
     exe = os.path.basename(args[0]).lower()
     for suffix in (".exe", ".cmd", ".bat"):
@@ -384,8 +440,15 @@ def _python_interpreter() -> str:
     return sys.executable
 
 
-def _execute_test_command(command: str) -> Tuple[Optional[int], str]:
-    """Runs an allowed test command; returns (exit code or None if not run, output text)."""
+def _execute_test_command(command: str, workspace: str | None = None,
+                          disposable: bool = False) -> tuple[int | None, str]:
+    """
+    Runs an allowed test command in the sandbox (see sandbox.py) against `workspace`
+    (default: the workspace root, copied first; pass disposable=True for a checkout that
+    may be used directly, such as the pipeline's git worktree). Returns (exit code, or
+    None if it could not run, and the output text including the isolation summary).
+    """
+    workspace = workspace or WORKSPACE_ROOT
     command = command.strip()
     if not command:
         return None, "Error: Empty command specified."
@@ -414,41 +477,42 @@ def _execute_test_command(command: str) -> Tuple[Optional[int], str]:
         args[0] = resolved
 
     try:
-        res = subprocess.run(args, cwd=WORKSPACE_ROOT, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace", timeout=TEST_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        return None, f"Error: Command '{command}' timed out after {TEST_TIMEOUT_SECONDS} seconds."
+        res = sandbox.run(args, workspace, TEST_TIMEOUT_SECONDS, copy=not disposable)
     except OSError as e:
         return None, f"Error executing test command '{command}': {e}"
-
-    output = []
-    if res.stdout:
-        output += ["=== STDOUT ===", res.stdout]
-    if res.stderr:
-        output += ["=== STDERR ===", res.stderr]
-    output.append(f"\nExit Code: {res.returncode}")
-    return res.returncode, _truncate("\n".join(output))
+    isolation = "Sandbox: " + "; ".join(res.isolation)
+    if res.timed_out:
+        return None, (f"Error: Command '{command}' timed out after {TEST_TIMEOUT_SECONDS} seconds "
+                      f"(process tree killed).\n{isolation}\n{_truncate(res.output)}")
+    output = ["=== OUTPUT ===", res.output] if res.output else []
+    output += [isolation, f"\nExit Code: {res.exit_code}"]
+    return res.exit_code, _truncate("\n".join(output))
 
 
 @_tool("write")
 def run_local_tests(command: str) -> str:
     """
-    Runs a test-suite command inside the workspace and returns its console output
-    and exit code. Only test-runner invocations are allowed (e.g. `python -m pytest`,
-    `python -m unittest discover`, `npm test`, `cargo test`); `python` resolves to
-    the workspace virtualenv when one exists.
+    Runs a test-suite command in a sandbox and returns its console output and exit code.
+    The sandbox runs against a temporary copy of the project (your files cannot be
+    modified) with a scrubbed environment (no tokens or keys; home/temp redirected) and
+    memory/process limits; the whole process tree is killed on timeout. The output states
+    which protections were active. Only test-runner invocations are allowed (e.g.
+    `python -m pytest`, `python -m unittest discover`, `npm test`, `cargo test`); `python`
+    resolves to the workspace virtualenv when one exists.
     """
     return _execute_test_command(command)[1]
 
 
 def _pr_metadata_path(branch_name: str) -> str:
-    # Branch names may contain "/" (feature/x); keep the draft file a flat name in the workspace root.
-    return os.path.join(WORKSPACE_ROOT, f".novus_pr_{re.sub(r'[^A-Za-z0-9._-]', '_', branch_name)}.md")
+    # Inside the tool-owned index dir (never staged), so runs leave no stray files in the project.
+    # Branch names may contain "/" (feature/x); keep the draft file a flat name.
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", branch_name)
+    return os.path.join(WORKSPACE_ROOT, codebase_context.INDEX_DIRNAME, "prs", f"{safe}.md")
 
 
 @_tool("destructive")
 def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str, pr_description: str,
-                            files: Optional[List[str]] = None) -> str:
+                            files: list[str] | None = None) -> str:
     """
     Creates/checks out `branch_name`, stages changes, commits, and writes draft PR metadata.
 
@@ -469,7 +533,7 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
         except git.GitCommandError:
             return f"Error: '{branch_name}' is not a valid git branch name."
 
-        to_stage: List[str] = []
+        to_stage: list[str] = []
         for path in files or []:
             full = _resolve_workspace_path(path)
             if not is_path_in_workspace(full):
@@ -502,24 +566,19 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
         else:
             commit_info = "No staged changes to commit."
 
-        pr_metadata = f"""# Draft PR: {pr_title}
-
-## Target Branch
-`{branch_name}`
-
-## Description
-{pr_description}
-
----
-*Generated automatically by NovusPipeline Git Modernization Tool*
-"""
-        pr_file_path = _pr_metadata_path(branch_name)
-        with open(pr_file_path, "w", encoding="utf-8") as f:
-            f.write(pr_metadata)
-
+        pr_file_path = _write_pr_draft(branch_name, pr_title, pr_description)
         return f"{status_msg}\n{commit_info}\nDraft PR metadata written to '{pr_file_path}'."
     except Exception as e:
-        return f"Error performing Git modernization operations: {str(e)}"
+        return f"Error performing Git modernization operations: {e!s}"
+
+
+def _write_pr_draft(branch_name: str, pr_title: str, pr_description: str) -> str:
+    path = _pr_metadata_path(branch_name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# Draft PR: {pr_title}\n\n## Target Branch\n`{branch_name}`\n\n## Description\n{pr_description}\n\n"
+                "---\n*Generated automatically by NovusPipeline Git Modernization Tool*\n")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -567,10 +626,10 @@ def get_local_llm_status(probe: bool = False) -> str:
                          f"{worker.get('vram_allocated_gb', 0)} GB VRAM")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error getting local LLM status: {str(e)}"
+        return f"Error getting local LLM status: {e!s}"
 
 
-def _codebase_context(file_path: str) -> Tuple[Optional[dict], str]:
+def _codebase_context(file_path: str) -> tuple[dict | None, str]:
     """(file context from the codebase index, or None with a reason). Never raises."""
     try:
         index = codebase_context.get_index(WORKSPACE_ROOT)
@@ -582,7 +641,7 @@ def _codebase_context(file_path: str) -> Tuple[Optional[dict], str]:
         return None, f"{type(e).__name__}: {e}"
 
 
-def _broken_api(new_code: str, api_surface: List[str]) -> List[str]:
+def _broken_api(new_code: str, api_surface: list[str]) -> list[str]:
     """Symbols other modules import from this file that `new_code` no longer provides."""
     return missing_names(new_code, api_surface)
 
@@ -607,14 +666,19 @@ def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> 
         search_term = rag_query.strip() or " ".join(
             [LegacySmellDetector._BY_ID[s]["rag_query"] for s in smells[:3]] or
             [f"Modernize legacy code {os.path.basename(file_path)}"])
-        rag_guidelines = query_rag_guidelines(search_term, n_results=2)
+        active, rel = _standards(), _rel(file_path)
+        std_findings = active.scan(code, rel)
+        rag_guidelines = "\n\n".join(filter(None, [active.prompt_block(std_findings),
+                                                    query_rag_guidelines(search_term, n_results=2)]))
 
         ctx, _ = _codebase_context(file_path)
         context_md = codebase_context.format_file_context(ctx) if ctx else ""
         p = local_llm.propose_modernization(code, rag_guidelines, context_md,
-                                            required_names=ctx["api_surface"] if ctx else [])
+                                            required_names=ctx["api_surface"] if ctx else [],
+                                            standards_scan=lambda c: active.scan(c, rel))
         v = p["validation"]
-        verdict = ("✅ Passes validation (parses, no new smells, imported symbols kept)" if v["valid"]
+        verdict = ("✅ Passes validation (parses, no new smells or standard violations, imported symbols kept)"
+                   if v["valid"]
                    else "❌ Rejected: " + "; ".join(v["issues"]))
         details = [f"- **Engine**: `{p['engine']}`" + (f" (fallback reason: {p['error']})" if p["error"] else ""),
                    f"- **Validation**: {verdict}",
@@ -635,7 +699,7 @@ def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> 
             + (f"### Model Notes\n{p['raw']}" if p["engine"] == "rule-based" else "")
         )
     except Exception as e:
-        return f"Error generating LLM modernization proposal for '{file_path}': {str(e)}"
+        return f"Error generating LLM modernization proposal for '{file_path}': {e!s}"
 
 
 @_tool("read")
@@ -655,23 +719,56 @@ def analyze_legacy_codebase(file_path: str) -> str:
             return code
 
         findings = LegacySmellDetector.scan_code(code, file_path)
+        ruff_findings = ruff_backend.scan_code(code, file_path, *_ruff_settings())
+        learned = history_learner.get_learner(WORKSPACE_ROOT).scan(code, file_path) if file_path.endswith(".py") else []
+        active = _standards()
+        standard_findings = active.scan(code, _rel(file_path))
         report = [f"## Modernization Audit Report for `{file_path}`\n"]
 
-        if findings:
+        if findings or ruff_findings or learned or standard_findings:
+            guideline_cache: dict = {}
+
+            def guideline(f: dict) -> str:
+                key = (f["rag_query"], f["category"])
+                if key not in guideline_cache:
+                    guideline_cache[key] = query_rag_guidelines(f["rag_query"], category=f["category"], n_results=1)
+                return guideline_cache[key]
+
             by_smell: dict = {}
-            for f in findings:
+            by_severity = lambda f: codebase_context.SEVERITY_ORDER[f["severity"]]  # noqa: E731
+            for f in sorted(standard_findings, key=by_severity) + findings + sorted(ruff_findings, key=by_severity) \
+                    + learned:
                 by_smell.setdefault(f["smell_id"], []).append(f)
-            report.append(f"Found **{len(findings)}** code smell(s) of **{len(by_smell)}** kind(s):\n")
+            safe = sum(1 for f in ruff_findings + learned + standard_findings if f["fix"] == "safe")
+            total = len(findings) + len(ruff_findings) + len(learned) + len(standard_findings)
+            blocking = sum(1 for f in standard_findings if f["enforce"] == "block")
+            report.append(f"Found **{total}** finding(s) of **{len(by_smell)}** kind(s) "
+                          f"({len(standard_findings)} from your modernization standards"
+                          + (f", {blocking} of them blocking" if blocking else "") + ", "
+                          f"{len(findings)} built-in legacy rules, {len(ruff_findings)} Ruff, "
+                          f"{len(learned)} learned from this repository's history"
+                          + (f"; {safe} with a safe auto-fix" if safe else "") + "):\n")
             for smell_id, items in by_smell.items():
                 first = items[0]
-                report.append(f"### [{first['severity']}] `{smell_id}`: {first['name']} ({len(items)}x)")
+                fix = {"safe": " — safe auto-fix available", "unsafe": " — fix available, needs review"}.get(
+                    first.get("fix") or "", "")
+                report.append(f"### [{first['severity']}] `{smell_id}`: {first['name']} ({len(items)}x){fix}")
                 shown = items[:10]
                 report.append("```code\n" + "\n".join(f"L{f['line_number']}: {f['line_content']}" for f in shown)
                               + ("\n..." if len(items) > len(shown) else "") + "\n```")
-                rag_res = query_rag_guidelines(first["rag_query"], category=first["category"], n_results=1)
-                report.append(f"**Recommended Guideline**:\n{rag_res}\n\n---\n")
+                if first.get("url"):
+                    report.append(f"Rule docs: {first['url']}")
+                if first.get("source") == "standard":  # the organization's own rule is the guideline
+                    enforce = ("**blocking**: the pipeline will not commit this file while it remains"
+                               if first["enforce"] == "block" else "warning")
+                    report.append(f"**Standard** `{first['pack']}` ({enforce}):\n{first['guideline']}\n\n---\n")
+                    continue
+                if first.get("source") == "learned":  # the team's own commits are the guideline
+                    report.append(f"**Evidence from history**: {first['evidence']}\n\n---\n")
+                    continue
+                report.append(f"**Recommended Guideline**:\n{guideline(first)}\n\n---\n")
         else:
-            report.append("✅ No rule-based legacy code smells detected.\n")
+            report.append("✅ No legacy code smells detected by your standards, the built-in rules or Ruff.\n")
 
         if file_path.endswith(".py"):
             # The GNN is advisory: any failure here must not lose the rule-based audit above.
@@ -702,7 +799,42 @@ def analyze_legacy_codebase(file_path: str) -> str:
 
         return "\n".join(report)
     except Exception as e:
-        return f"Error analyzing legacy codebase for '{file_path}': {str(e)}"
+        return f"Error analyzing legacy codebase for '{file_path}': {e!s}"
+
+
+def _read_source(path: str) -> tuple[str, str]:
+    """(text with "\\n" newlines, the file's newline style), so rewrites keep CRLF files CRLF."""
+    with open(path, encoding="utf-8", errors="replace", newline="") as f:
+        raw = f.read()
+    return raw.replace("\r\n", "\n"), ("\r\n" if "\r\n" in raw else "\n")
+
+
+def _write_source(path: str, text: str, newline: str) -> None:
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(text.replace("\r\n", "\n").replace("\n", newline))
+
+
+def _ruff_settings() -> tuple[list[str], list[str]]:
+    active = _standards()
+    return active.ruff_select, active.ruff_ignore
+
+
+def _modernized_source(path: str, original: str, modernized_code: str = ""
+                       ) -> tuple[str | None, list[str], str | None]:
+    """(new code, change notes, error) for a file's content; nothing is written."""
+    if modernized_code.strip():
+        return modernized_code, ["Applied LLM / user-supplied modernized code."], None
+    if path.endswith(".py"):
+        new, notes = CodeModernizer.modernize_python(original)
+        # Pure renames the team made consistently in its own history; still test-gated by the caller.
+        new, learned_notes = history_learner.get_learner(WORKSPACE_ROOT).apply_fixes(new)
+        # The organization's standards last, so their fixes win.
+        new, standard_notes = _standards().apply_fixes(new, _rel(path))
+        return new, notes + learned_notes + standard_notes, None
+    if path.endswith((".ts", ".tsx", ".js", ".jsx")):
+        new, notes = CodeModernizer.modernize_typescript(original)
+        return new, notes, None
+    return None, [], "Error: Automated modernization rules not implemented for this file extension"
 
 
 @_tool("destructive")
@@ -724,18 +856,11 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
         if not os.path.isfile(full_path):
             return f"Error: File '{file_path}' does not exist."
 
-        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-            original_code = f.read()
+        original_code, newline = _read_source(full_path)
 
-        if modernized_code.strip():
-            new_code = modernized_code
-            applied_changes = ["Applied LLM / user-supplied modernized code."]
-        elif full_path.endswith(".py"):
-            new_code, applied_changes = CodeModernizer.modernize_python(original_code)
-        elif full_path.endswith((".ts", ".tsx", ".js", ".jsx")):
-            new_code, applied_changes = CodeModernizer.modernize_typescript(original_code)
-        else:
-            return f"Error: Automated modernization rules not implemented for file extension of '{file_path}'."
+        new_code, applied_changes, error = _modernized_source(full_path, original_code, modernized_code)
+        if error:
+            return f"{error} ('{file_path}')"
 
         notes = "\n".join(f"  - {c}" for c in applied_changes)
         if new_code == original_code:
@@ -750,8 +875,7 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
                            f"file, which the new code no longer defines.")
 
         shutil.copyfile(full_path, full_path + ".bak")
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(new_code)
+        _write_source(full_path, new_code, newline)
 
         return (
             f"Successfully updated '{file_path}'.\n"
@@ -759,13 +883,13 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
             f"Applied Transformations:\n{notes}{warning}"
         )
     except Exception as e:
-        return f"Error applying modernization to '{file_path}': {str(e)}"
+        return f"Error applying modernization to '{file_path}': {e!s}"
 
 
 _PYTEST_AVAILABLE: dict = {}
 
 
-def _default_test_command(ctx: Optional[dict]) -> str:
+def _default_test_command(ctx: dict | None) -> str:
     """Tests that import the file (from the import graph) if any, else the whole suite."""
     python = _python_interpreter()
     if python not in _PYTEST_AVAILABLE:
@@ -783,16 +907,7 @@ def _default_test_command(ctx: Optional[dict]) -> str:
     return "python -m unittest discover"
 
 
-def _restore(full_path: str) -> str:
-    backup = full_path + ".bak"
-    if os.path.exists(backup):
-        shutil.copyfile(backup, full_path)
-        os.remove(backup)
-        return "Rolled back from backup snapshot."
-    return "Backup snapshot file not found for rollback."
-
-
-@_tool("destructive", timeout=3600)
+@_tool("write", timeout=3600)
 def run_autonomous_modernization_pipeline(
     file_path: str,
     test_command: str = "",
@@ -800,96 +915,141 @@ def run_autonomous_modernization_pipeline(
     use_llm: bool = False,
 ) -> str:
     """
-    Executes the complete, codebase-aware autonomous refactoring loop:
-      1. Audits the file (rules + GNN) and loads its codebase context from the index.
-      2. Applies parity-preserving modernizations (with a .bak safety snapshot).
-      3. Rolls back if the change removes symbols other modules import.
-      4. Runs verification tests: `test_command`, or by default the tests that import
-         this file (falling back to the whole suite).
-      5. Exit code 0 -> commits only this file on `branch_name` and drafts a PR that lists
-         the blast radius and follow-up files with the same smells. Otherwise rolls back.
+    Codebase-aware, sandboxed modernization of one file. Everything happens in a disposable
+    git worktree, so your working copy and current branch are never modified; the only
+    lasting effect of a successful run is a commit on `branch_name`.
+      1. Audits the file (your standards + rules + Ruff + GNN) and loads its codebase context.
+      2. Rewrites it (rule engine, learned and standard fixes, or a validated LLM proposal
+         with `use_llm`, which is given your standards and may not add violations).
+      3. Rejects the change if it removes symbols other modules import, or if the file
+         still violates a standard with `enforce = "block"`.
+      4. Runs verification tests in the sandbox: `test_command`, or by default the tests
+         that import this file (falling back to the whole suite).
+      5. Exit code 0 -> commits only this file on `branch_name` (created at HEAD, or extended
+         if it exists) and drafts a PR with blast radius and follow-up files.
 
     Args:
-        file_path:    Target legacy file to modernize.
+        file_path:    Target legacy file to modernize (must have no uncommitted changes).
         test_command: Optional test command; empty selects related tests automatically.
-        branch_name:  Target Git branch for PR creation (default 'auto-modernization-branch').
-        use_llm:      Try the fine-tuned local LLM first. Its proposal is applied only if it
-                      passes validation (parses, no new smells, imported symbols kept);
-                      otherwise the rule engine is used. Tests gate both.
+        branch_name:  Branch that receives the commit (default 'auto-modernization-branch').
+        use_llm:      Try the local LLM first; its proposal is used only if it passes
+                      validation (parses, no new smells, imported symbols kept). Tests gate both.
     """
+    import tempfile
+
+    import git
+
     full_path = _resolve_workspace_path(file_path)
     if not is_path_in_workspace(full_path):
         return f"Error: Path '{file_path}' is outside authorized project workspace."
-
     try:
-        ctx, _ = _codebase_context(file_path)
-        audit_res = analyze_legacy_codebase(file_path)
+        repo = git.Repo(WORKSPACE_ROOT)
+    except (git.InvalidGitRepositoryError, git.NoSuchPathError):
+        return "Error: the pipeline needs a git repository (it commits the result on a branch)."
+    try:
+        repo.git.check_ref_format("--branch", branch_name)
+    except git.GitCommandError:
+        return f"Error: '{branch_name}' is not a valid git branch name."
+    if not repo.head.is_detached and repo.active_branch.name == branch_name:
+        return f"Error: '{branch_name}' is your checked-out branch; choose a separate branch for the pipeline."
+    rel = os.path.relpath(full_path, repo.working_tree_dir).replace(os.sep, "/")
+    if repo.git.status("--porcelain", "--", rel).strip():
+        return (f"Error: '{file_path}' has uncommitted changes. Commit or stash them first: the pipeline works "
+                "from committed code in a separate worktree so it never touches your working copy.")
+
+    ctx, _ = _codebase_context(file_path)
+    audit_res = analyze_legacy_codebase(file_path)
+    start_point = branch_name if branch_name in [b.name for b in repo.branches] else "HEAD"
+    wt_root = tempfile.mkdtemp(prefix="novus-worktree-")
+    wt = os.path.join(wt_root, "wt")
+    try:
+        repo.git.worktree("add", "--detach", wt, start_point)
+        wt_file = os.path.join(wt, rel)
+        if not os.path.isfile(wt_file):
+            return f"Error: '{rel}' does not exist at {start_point}."
+        original, newline = _read_source(wt_file)
 
         engine_note = "Engine: rule-based modernizer."
-        llm_code = None
-        if use_llm and full_path.endswith(".py"):
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                original = f.read()
-            smells = sorted({x["smell_id"] for x in LegacySmellDetector.scan_code(original, file_path)})
-            rag = query_rag_guidelines(" ".join(LegacySmellDetector._BY_ID[s]["rag_query"] for s in smells[:3])
-                                       or "modernize legacy python", n_results=2)
+        llm_code = ""
+        if use_llm and rel.endswith(".py"):
+            smells = sorted({x["smell_id"] for x in LegacySmellDetector.scan_code(original, rel)})
+            active = _standards()
+            rag = "\n\n".join(filter(None, [
+                active.prompt_block(active.scan(original, rel)),
+                query_rag_guidelines(" ".join(LegacySmellDetector._BY_ID[s]["rag_query"] for s in smells[:3])
+                                     or "modernize legacy python", n_results=2)]))
             p = local_llm.propose_modernization(original, rag,
                                                 codebase_context.format_file_context(ctx) if ctx else "",
-                                                required_names=ctx["api_surface"] if ctx else [])
+                                                required_names=ctx["api_surface"] if ctx else [],
+                                                standards_scan=lambda c: active.scan(c, rel))
             if p["engine"] != "rule-based" and p["validation"]["valid"] and p["code"] and p["code"] != original:
-                llm_code = p["code"]
+                llm_code, std_notes = active.apply_fixes(p["code"], rel)
                 engine_note = (f"Engine: `{p['engine']}` (validated; resolved "
                                f"{', '.join(p['validation']['resolved']) or 'no rule-engine smells'}).")
             else:
                 reason = p["error"] or "; ".join(p["validation"]["issues"]) or "no change proposed"
                 engine_note = f"Engine: rule-based modernizer (LLM proposal not used: {reason})."
 
-        mod_res = apply_code_modernization(file_path, modernized_code=llm_code or "")
-        if mod_res.startswith("Error"):
-            return f"Pipeline Aborted during modernization phase:\n{mod_res}"
-        if mod_res.startswith("No applicable"):
-            return f"Pipeline finished: nothing to modernize automatically.\n{mod_res}"
+        new_code, notes, error = _modernized_source(rel, original, llm_code)
+        if error:
+            return f"Pipeline Aborted during modernization phase:\n{error} ('{file_path}')"
+        if llm_code:
+            notes += std_notes
+        changes = "\n".join(f"  - {c}" for c in notes)
+        blocking = _standards().blocking(new_code, rel)
+        if blocking:
+            listed = "\n".join(f"  - L{f['line_number']} `{f['smell_id']}` {f['name']}: "
+                               f"{f['line_content']}" for f in blocking[:20])
+            return (f"❌ Pipeline stopped: after modernization `{file_path}` still violates blocking standards, so "
+                    f"nothing was committed. These need a manual change (or `use_llm=true`):\n{listed}\n\n"
+                    f"Automated changes that were prepared:\n{changes or '  - none'}")
+        if new_code == original:
+            return f"Pipeline finished: nothing to modernize automatically in '{file_path}'.\n{changes}"
+        broken = _broken_api(new_code, ctx["api_surface"]) if ctx and rel.endswith(".py") else []
+        if broken:
+            return (f"❌ Pipeline stopped: the modernized file would no longer provide "
+                    f"{', '.join(f'`{n}`' for n in broken)}, which other modules import. Nothing was changed.")
+        _write_source(wt_file, new_code, newline)
 
-        if ctx and full_path.endswith(".py"):
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                broken = _broken_api(f.read(), ctx["api_surface"])
-            if broken:
-                return (f"❌ Pipeline rolled back: the modernized file no longer provides "
-                        f"{', '.join(f'`{n}`' for n in broken)}, which other modules import.\n{_restore(full_path)}")
-
+        sandbox.link_dependency_dirs(WORKSPACE_ROOT, wt)
         command = test_command.strip() or _default_test_command(ctx)
-        exit_code, test_res = _execute_test_command(command)
-
+        exit_code, test_res = _execute_test_command(command, workspace=wt, disposable=True)
         if exit_code != 0:
             reason = "could not be run" if exit_code is None else f"failed (exit code {exit_code})"
-            return (f"❌ Autonomous Modernization Pipeline: verification `{command}` {reason}.\n"
-                    f"{_restore(full_path)}\n\nTest Output:\n{test_res}")
+            return (f"❌ Autonomous Modernization Pipeline: verification `{command}` {reason}. "
+                    f"The change was discarded; your working copy was never modified.\n\nTest Output:\n{test_res}")
+
+        wt_repo = git.Repo(wt)
+        wt_repo.git.add("--", rel)
+        wt_repo.git.commit("-m", f"refactor: autonomous modernization of {os.path.basename(rel)}", "--", rel)
+        sha = wt_repo.head.commit.hexsha
+        wt_repo.git.branch("-f", branch_name, sha)
 
         impact = codebase_context.format_file_context(ctx) if ctx else "_Codebase context unavailable._"
         follow_ups = (ctx or {}).get("same_smell_elsewhere", [])
-        pr_res = create_git_migration_pr(
-            branch_name=branch_name,
-            commit_message=f"refactor: autonomous modernization of {os.path.basename(file_path)}",
-            pr_title=f"Autonomous Modernization: {os.path.basename(file_path)}",
-            pr_description=(f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{engine_note}\n{mod_res}\n\n"
-                            f"### Test Verification\nPassed (exit code 0): `{command}`\n\n### Impact\n{impact}"),
-            files=[file_path],
-        )
-        if os.path.exists(full_path + ".bak"):
-            os.remove(full_path + ".bak")
-
+        pr_path = _write_pr_draft(
+            branch_name, f"Autonomous Modernization: {os.path.basename(rel)}",
+            f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{engine_note}\n{changes}\n\n"
+            f"### Test Verification\nPassed (exit code 0): `{command}`\n\n### Impact\n{impact}")
         follow_up_md = ("\n\n5. Follow-up candidates (same smells elsewhere):\n"
                         + "\n".join(f"   - `{p}`" for p in follow_ups[:10])) if follow_ups else ""
         return (
             f"🎉 Autonomous Modernization Pipeline Completed Successfully!\n\n"
             f"1. Audit Findings & RAG Match:\n{audit_res[:300]}...\n\n"
-            f"2. Transformations Applied ({engine_note}):\n{mod_res}\n\n"
+            f"2. Transformations Applied ({engine_note}):\n{changes}\n\n"
             f"3. Verification (`{command}`):\n{test_res}\n\n"
-            f"4. Git Status:\n{pr_res}{follow_up_md}"
+            f"4. Git: committed `{sha[:8]}` on `{branch_name}` (from {start_point}) in an isolated worktree; "
+            f"your working copy and current branch are unchanged. Draft PR: '{pr_path}'.{follow_up_md}"
         )
     except Exception as e:
-        _restore(full_path)
-        return f"Error executing autonomous modernization pipeline for '{file_path}': {str(e)}"
+        return f"Error executing autonomous modernization pipeline for '{file_path}': {type(e).__name__}: {e}"
+    finally:
+        sandbox.unlink_dependency_dirs(wt)  # before removal: never delete through the node_modules link
+        with contextlib.suppress(git.GitCommandError):
+            repo.git.worktree("remove", "--force", wt)
+        shutil.rmtree(wt_root, ignore_errors=True)
+        with contextlib.suppress(git.GitCommandError):
+            repo.git.worktree("prune")
 
 
 # ---------------------------------------------------------------------------
@@ -913,7 +1073,7 @@ def format_modernization_report(
     """
     try:
         audit_res = analyze_legacy_codebase(file_path)
-        ctx, reason = _codebase_context(file_path)
+        ctx, _reason = _codebase_context(file_path)
         command = test_command.strip() or _default_test_command(ctx)
         exit_code, test_res = _execute_test_command(command)
         mod_details = (f"Rule-engine / LLM modernization of `{file_path}`. "
@@ -936,7 +1096,7 @@ def format_modernization_report(
             f"Report Summary Preview:\n{report_md[:400]}..."
         )
     except Exception as e:
-        return f"Error formatting modernization report for '{file_path}': {str(e)}"
+        return f"Error formatting modernization report for '{file_path}': {e!s}"
 
 
 @_tool("destructive")
@@ -985,7 +1145,7 @@ def finalize_git_migration_pr(
             f"```"
         )
     except Exception as e:
-        return f"Error finalizing Git migration PR for branch '{branch_name}': {str(e)}"
+        return f"Error finalizing Git migration PR for branch '{branch_name}': {e!s}"
 
 
 # ---------------------------------------------------------------------------
@@ -1023,7 +1183,7 @@ def get_gnn_model_status() -> str:
                 lines.append(f"  - `{label}`: F1 {f1}, threshold {thresholds.get(label, 0.5)}")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error getting GNN model status: {str(e)}"
+        return f"Error getting GNN model status: {e!s}"
 
 
 @_tool("read")
@@ -1059,13 +1219,13 @@ def analyze_code_structure_gnn(file_path: str) -> str:
         )
         return "\n".join(lines)
     except SyntaxError as e:
-        return f"Error: '{file_path}' is not valid Python 3 syntax, cannot build AST graph: {str(e)}"
+        return f"Error: '{file_path}' is not valid Python 3 syntax, cannot build AST graph: {e!s}"
     except ValueError as e:
-        return f"Error: '{file_path}' cannot be analyzed by the GNN: {str(e)}"
+        return f"Error: '{file_path}' cannot be analyzed by the GNN: {e!s}"
     except RuntimeError as e:
-        return f"Error: GNN model unavailable: {str(e)}"
+        return f"Error: GNN model unavailable: {e!s}"
     except Exception as e:
-        return f"Error running GNN structural analysis on '{file_path}': {str(e)}"
+        return f"Error running GNN structural analysis on '{file_path}': {e!s}"
 
 
 # ---------------------------------------------------------------------------
@@ -1099,12 +1259,225 @@ def index_codebase(force_rebuild: bool = False) -> str:
         return f"Error indexing codebase: {type(e).__name__}: {e}"
 
 
+# ---------------------------------------------------------------------------
+# Modernization standards (rule packs)
+# ---------------------------------------------------------------------------
+
+@_tool("read")
+def list_modernization_standards() -> str:
+    """
+    Lists the modernization standards that apply to this workspace: rule packs from your user
+    data directory (personal) and from `.novus/standards/` (project, shared by the team), every
+    rule with its detection, automatic fix and enforcement, problems in pack files, and the
+    built-in example packs you can install with `install_standard_pack`.
+    """
+    try:
+        active = _standards()
+        lines = [f"## Modernization Standards: {len(active.rules)} rule(s) from {len(active.packs)} pack(s)\n"]
+        for pack in active.packs:
+            lines.append(f"- **{pack['name']}** ({pack['scope']}, `{pack['path']}`): {pack['rules']} rule(s)"
+                         + (f" - {pack['description']}" if pack["description"] else ""))
+        if active.rules:
+            lines.append("\n### Rules")
+        for r in sorted(active.rules, key=lambda r: (codebase_context.SEVERITY_ORDER[r["severity"]], r["id"])):
+            detect = "; ".join(filter(None, [
+                f"calls {', '.join(r['calls'])}" + (f" without `{r['require_keyword']}=`" if r["require_keyword"] else "")
+                if r["calls"] else "",
+                f"imports {', '.join(r['imports'])}" if r["imports"] else "",
+                f"pattern `{r['pattern']}`" if r["pattern"] else ""]))
+            fix = ("replace call with `" + r["replace_call"] + "`" if r["replace_call"] else
+                   "replace import with `" + r["replace_import"] + "`" if r["replace_import"] else
+                   "add `" + r["add_keyword"] + "`" if r["add_keyword"] else
+                   "regex replacement" if r["replacement"] else "none (manual or LLM)")
+            scope = (f"; only {', '.join(r['paths'])}" if r["paths"] else "") + \
+                (f"; except {', '.join(r['exclude'])}" if r["exclude"] else "")
+            lines.append(f"- [{r['severity']}] `{r['id']}` {r['title']} ({r['enforce']}, pack {r['pack']}): "
+                         f"detects {detect}; auto-fix: {fix}{scope}")
+        if active.ruff_select or active.ruff_ignore:
+            lines.append(f"\n**Ruff tuning**: select {active.ruff_select or '-'}, ignore {active.ruff_ignore or '-'}")
+        if active.errors:
+            lines.append("\n### ⚠️ Problems (these rules are not active)")
+            lines += [f"- {e}" for e in active.errors]
+        installed = {p["name"] for p in active.packs}
+        available = [n for n in standards.builtin_packs() if n not in installed]
+        if available:
+            lines.append(f"\n**Built-in example packs** (install with `install_standard_pack`): "
+                         f"{', '.join(f'`{n}`' for n in available)}")
+        if not active.rules:
+            lines.append("\nNo standards yet: add rules with `add_modernization_rule`, write a pack in "
+                         "`.novus/standards/*.toml`, or install a built-in pack.")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing modernization standards: {type(e).__name__}: {e}"
+
+
+@_tool("write")
+def add_modernization_rule(
+    rule_id: str,
+    title: str,
+    guideline: str,
+    severity: str = "MEDIUM",
+    calls: list[str] | None = None,
+    imports: list[str] | None = None,
+    pattern: str = "",
+    require_keyword: str = "",
+    replace_call: str = "",
+    replace_import: str = "",
+    add_keyword: str = "",
+    replacement: str = "",
+    paths: list[str] | None = None,
+    exclude: list[str] | None = None,
+    enforce: str = "warn",
+    category: str = "python",
+    scope: str = "project",
+) -> str:
+    """
+    Adds (or replaces) a modernization rule, so audits, the LLM and the pipeline hold code to
+    your industry's or organization's standard. Stored in `.novus/standards/custom.toml`
+    (scope 'project', shared via git) or in your user data directory (scope 'user', applies to
+    all your projects). Takes effect immediately.
+
+    Detection needs at least one of `calls`, `imports`, `pattern`. Examples:
+      - every HTTP call has a timeout: calls=["requests.get", "requests.post"],
+        require_keyword="timeout", add_keyword="timeout=30"
+      - no pickle in the payments service: imports=["pickle"], paths=["src/payments/**"],
+        enforce="block"
+      - internal API migration: calls=["legacy_db.query"], replace_call="db.query"
+
+    Args:
+        rule_id:         Unique id, e.g. 'ACME-001' (letters, digits, '-', '_', '.').
+        title:           One-line name of the standard.
+        guideline:       Markdown explaining the standard and the preferred alternative; shown in
+                         audits, returned by query_rag_guidelines, and given to the LLM.
+        severity:        CRITICAL, HIGH, MEDIUM or LOW.
+        calls:           Dotted call targets as imported, e.g. ["yaml.load"]; aliases are resolved.
+        imports:         Modules that must not be imported (submodules included).
+        pattern:         Regex matched per line, with strings and comments blanked out.
+        require_keyword: With `calls`: only flag calls missing this keyword argument.
+        replace_call:    Auto-fix: new dotted call target (an import is added if needed).
+        replace_import:  Auto-fix: module that replaces the banned import.
+        add_keyword:     Auto-fix for `require_keyword`, e.g. "timeout=30".
+        replacement:     Auto-fix: regex replacement for `pattern` (lines with strings/comments are skipped).
+        paths:           Only apply to files matching these globs (e.g. ["src/payments/**"]).
+        exclude:         Skip files matching these globs (e.g. ["tests/**"]).
+        enforce:         'warn' (report; LLM proposals may not add violations) or 'block' (the
+                         pipeline will not commit a file that still violates the rule).
+        category:        Guideline category for query_rag_guidelines filters (default 'python';
+                         'typescript'/'javascript' makes `pattern` rules apply to TS/JS files).
+        scope:           'project' (default) or 'user'.
+    """
+    try:
+        if scope not in ("project", "user"):
+            return "Error: scope must be 'project' or 'user'."
+        raw = {"id": rule_id, "title": title, "guideline": guideline, "severity": severity, "calls": calls or [],
+               "imports": imports or [], "pattern": pattern, "require_keyword": require_keyword,
+               "replace_call": replace_call, "replace_import": replace_import, "add_keyword": add_keyword,
+               "replacement": replacement, "paths": paths or [], "exclude": exclude or [], "enforce": enforce,
+               "category": category}
+        path, problems = standards.upsert_rule(WORKSPACE_ROOT, raw, scope)
+        if problems:
+            return "Error: rule not saved: " + "; ".join(problems)
+        try:
+            index = codebase_context.get_index(WORKSPACE_ROOT, refresh=False)
+            index.refresh()  # the standards signature changed: findings are recomputed
+            hits = sum(1 for rec in index.files.values()
+                       if any(f["smell_id"] == rule_id.strip() for f in rec["rule_findings"]))
+            usage = f"\nCurrently violated in {hits} indexed file(s)."
+        except Exception:
+            usage = ""
+        return f"Saved rule `{rule_id.strip()}` to `{path}` ({scope} standards).{usage}\n\n" + \
+            _format_standard(_standards().get(rule_id.strip()))
+    except Exception as e:
+        return f"Error adding modernization rule: {type(e).__name__}: {e}"
+
+
+@_tool("destructive")
+def remove_modernization_rule(rule_id: str, scope: str = "project") -> str:
+    """
+    Removes a rule added with `add_modernization_rule` (from the scope's `custom.toml`). Rules
+    in other pack files are edited in those files.
+
+    Args:
+        rule_id: Id of the rule to remove.
+        scope:   'project' (default) or 'user'.
+    """
+    try:
+        if scope not in ("project", "user"):
+            return "Error: scope must be 'project' or 'user'."
+        ok, detail = standards.remove_rule(WORKSPACE_ROOT, rule_id.strip(), scope)
+        return f"Removed rule `{rule_id}` from `{detail}`." if ok else f"Error: {detail}"
+    except Exception as e:
+        return f"Error removing modernization rule: {type(e).__name__}: {e}"
+
+
+@_tool("write")
+def install_standard_pack(name: str, scope: str = "project") -> str:
+    """
+    Installs a built-in example rule pack (see `list_modernization_standards`) by copying it to
+    `.novus/standards/<name>.toml` (or the user standards directory), where it can be edited.
+
+    Args:
+        name:  Built-in pack name, e.g. 'secure-defaults' or 'python-312-ready'.
+        scope: 'project' (default) or 'user'.
+    """
+    try:
+        if scope not in ("project", "user"):
+            return "Error: scope must be 'project' or 'user'."
+        target, error = standards.install_pack(WORKSPACE_ROOT, name.strip(), scope)
+        if error:
+            return f"Error: {error}"
+        active = _standards()
+        count = sum(1 for r in active.rules if os.path.abspath(r["file"]) == os.path.abspath(target))
+        return f"Installed `{name}` ({count} rules) at `{target}`. Edit that file to adapt it to your standards."
+    except Exception as e:
+        return f"Error installing standard pack: {type(e).__name__}: {e}"
+
+
+@_tool("write", timeout=3600)
+def learn_from_history(max_commits: int = 2000, min_support: int = history_learner.DEFAULT_MIN_SUPPORT) -> str:
+    """
+    Mines this repository's git history for smells the team has already been fixing:
+    calls and imports that were repeatedly replaced the same way across separate commits
+    (e.g. `self.assertEquals` -> `self.assertEqual` in 7 commits). Each learned rule comes
+    with its evidence (support, consistency, example commits). Remaining uses then show up
+    in audits, file context and the overview; pure renames with near-unanimous history are
+    applied by the modernization pipeline, which still runs the tests in the sandbox.
+    Mining is incremental and also runs in the background after each index refresh; call
+    this to mine now. Only writes `.novus_index/learned.json`.
+
+    Args:
+        max_commits: Maximum number of not-yet-mined commits to analyze (newest first).
+        min_support: Minimum number of distinct commits that must show a replacement (at least 2).
+    """
+    try:
+        learner = history_learner.get_learner(WORKSPACE_ROOT)
+        stats = learner.refresh(max_new_commits=max(1, min(max_commits, 20000)))
+        if stats.get("error"):
+            return f"Error: cannot learn from history: {stats['error']}"
+        rules = learner.rules(min_support=max(2, min_support))
+        lines = [f"## Learned From History: {stats['total_commits']} commit(s) mined "
+                 f"({stats['mined']} new, {stats['seconds']}s), {len(rules)} rule(s)\n"]
+        if not rules:
+            lines.append("No replacement was made consistently in enough separate commits yet.")
+        for rule in rules[:50]:
+            fix = "auto-fixable (pure rename)" if learner.auto_fixable(rule) else "suggestion only"
+            lines.append(f"- `{rule['id']}` [{rule['kind']}] `{rule['old']}` -> `{rule['new']}`: "
+                         f"{rule['support']} commits, consistency {rule['consistency']:.0%}, {fix}")
+            for e in rule["examples"][:2]:
+                lines.append(f"  - {e['commit'][:7]} \"{e['message']}\" (`{e['file']}`, {e['qualname']})")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error learning from history: {type(e).__name__}: {e}"
+
+
 @_tool("read")
 def get_codebase_overview(top_n: int = 10) -> str:
     """
-    Codebase-wide modernization overview: files ranked by smell risk (rule engine + GNN,
-    severity-weighted) with their blast radius (number of importing modules), the most
-    depended-on modules, and the smell distribution. Use it to decide what to modernize first.
+    Codebase-wide modernization overview: files ranked by risk (built-in rules + Ruff + GNN +
+    codebase-level smells, severity-weighted) with their blast radius, codebase-level smells
+    (import cycles, dead code, duplicated logic, untested hotspots, god modules, deprecated
+    APIs, unresolvable dynamic imports), the most depended-on modules, and the smell
+    distribution. Use it to decide what to modernize first.
 
     Args:
         top_n: Number of hotspot files / hub modules to list (default 10, max 50).
@@ -1119,13 +1492,42 @@ def get_codebase_overview(top_n: int = 10) -> str:
         lines = [f"## Codebase Overview: {len(files)} Python files, "
                  f"{sum(len(r['functions']) for r in files.values())} functions\n"]
         if index.gnn_error:
-            lines.append(f"_GNN signals unavailable: {index.gnn_error}_\n")
+            lines.append(f"_GNN signals unavailable: {index.gnn_error}_")
+        ruff_ok, ruff_note = ruff_backend.available()
+        if not ruff_ok:
+            lines.append(f"_Ruff findings unavailable: {ruff_note}_")
 
-        lines.append("### 🔥 Modernization Hotspots (risk = severity-weighted smells; source of each signal)")
+        lines.append("\n### 🔥 Modernization Hotspots (risk = severity-weighted smells; [source] of each signal)")
         for h in index.hotspots(top_n):
-            smells = ", ".join(f"{s} [{src}]" for s, src in h["smells"].items())
-            lines.append(f"- `{h['path']}` risk **{h['risk']:.0f}**, imported by {h['dependents']} module(s)"
-                         f"{' (test)' if h['is_test'] else ''}: {smells}")
+            lines.append(f"- `{h['path']}` risk **{h['risk']:.1f}**, imported by {h['dependents']} module(s)"
+                         f"{' (test)' if h['is_test'] else ''}: {codebase_context.summarize_smells(h['smells'])}")
+
+        context = index.context_smells()
+        by_kind: dict = {}
+        for rel, smells in context.items():
+            for s in smells:
+                by_kind.setdefault(s["smell_id"], []).append((rel, s))
+        if by_kind:
+            lines.append("\n### 🏗️ Codebase-Level Smells (need the whole codebase to see)")
+            for smell_id in codebase_context.CONTEXT_SMELLS:
+                items = by_kind.get(smell_id, [])
+                if not items:
+                    continue
+                name, severity = codebase_context.CONTEXT_SMELLS[smell_id]
+                lines.append(f"- [{severity}] `{smell_id}` {name}: {len(items)} occurrence(s)")
+                for rel, s in items[:3]:
+                    lines.append(f"  - `{rel}`{' L' + str(s['line']) if s.get('line') else ''}: {s['detail']}")
+
+        learned = index.learned_smells()
+        rules = history_learner.get_learner(WORKSPACE_ROOT).rules()
+        if rules:
+            lines.append("\n### 🎓 Learned From This Repository's History (replacements the team made repeatedly)")
+            for rule in rules[:top_n]:
+                affected = [rel for rel, smells in learned.items() if any(s["smell_id"] == rule["id"] for s in smells)]
+                fix = "auto-fixable" if history_learner.HistoryLearner.auto_fixable(rule) else "suggestion"
+                lines.append(f"- `{rule['id']}` `{rule['old']}` -> `{rule['new']}`: {rule['support']} commits, "
+                             f"consistency {rule['consistency']:.0%}, {fix}; still used in {len(affected)} file(s)"
+                             + (f", e.g. `{affected[0]}`" if affected else ""))
 
         fan_in = Counter()
         for rel in files:
@@ -1134,13 +1536,14 @@ def get_codebase_overview(top_n: int = 10) -> str:
         for rel, count in fan_in.most_common(top_n):
             lines.append(f"- `{rel}`: imported by {count} module(s)")
 
-        distribution = Counter()
+        distribution, names = Counter(), {}
         for rec in files.values():
             distribution.update({f["smell_id"] for f in rec["rule_findings"]})
+            names.update({f["smell_id"]: f.get("name", "") for f in rec["rule_findings"]})
         if distribution:
-            lines.append("\n### 📊 Files Affected per Smell (rule engine)")
-            for smell_id, count in distribution.most_common():
-                lines.append(f"- `{smell_id}` {LegacySmellDetector._BY_ID[smell_id]['name']}: {count} file(s)")
+            lines.append("\n### 📊 Files Affected per Finding (built-in rules + Ruff)")
+            for smell_id, count in distribution.most_common(top_n * 2):
+                lines.append(f"- `{smell_id}` {names[smell_id]}: {count} file(s)")
 
         broken = [rel for rel, rec in files.items() if rec["parse_error"]]
         if broken:
@@ -1218,22 +1621,27 @@ def modernization_workflow(file_path: str = "") -> str:
     target = f"`{file_path}`" if file_path else "the highest-risk file"
     return (
         f"Modernize {target} in this codebase safely:\n"
+        "0. Call `list_modernization_standards`. If the user has industry or organization standards that "
+        "are not there yet, add them first with `add_modernization_rule` (or `install_standard_pack`), so "
+        "every later step holds the code to them.\n"
         "1. If no file is given, call `get_codebase_overview` and pick the top hotspot that is not a test.\n"
         "2. Call `get_file_context` to see its dependents, the public API they use (must not change), "
         "related tests, and which functions hold the smells.\n"
-        "3. Call `analyze_legacy_codebase` for the rule-engine findings and matching guidelines.\n"
+        "3. Call `analyze_legacy_codebase` for the findings (standards, rules, Ruff, learned) and guidelines.\n"
         "4. Optionally call `generate_llm_modernization_proposal`; only proposals marked "
         "'Passes validation' are safe to apply.\n"
         "5. Call `run_autonomous_modernization_pipeline` (set `use_llm` to try the LLM first). It runs the "
-        "related tests, rolls back on failure or API breakage, and commits only that file.\n"
+        "related tests, rolls back on failure, API breakage or remaining blocking-standard violations, and "
+        "commits only that file.\n"
         "6. Review the follow-up candidates it lists and repeat for them; use `find_similar_code` to find "
         "other copies of the same pattern."
     )
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     """Console entry point: `novuspipeline [--workspace DIR] [--transport stdio|http]`."""
     import argparse
+
     from . import __version__
 
     global WORKSPACE_ROOT
