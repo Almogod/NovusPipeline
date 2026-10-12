@@ -29,8 +29,8 @@ import random
 import statistics
 import sysconfig
 import time
+from collections.abc import Callable
 from dataclasses import asdict, replace
-from typing import Callable, Dict, List, Optional, Tuple
 
 from .code_graph import build_graph_from_code
 from .gnn_model import SMELL_LABELS, GNNConfig, build_model, graph_dict_to_pyg_data, save_checkpoint
@@ -40,7 +40,7 @@ from .modernizer import LegacySmellDetector
 # Teacher
 # ---------------------------------------------------------------------------
 
-def teacher_labels(code: str) -> List[float]:
+def teacher_labels(code: str) -> list[float]:
     """
     LegacySmellDetector labels for `code` — the exact rule engine the server
     runs, so GNN/rule agreement in `analyze_legacy_codebase` is meaningful. The
@@ -59,9 +59,9 @@ def teacher_labels(code: str) -> List[float]:
 # negatives below, so it measures generalization rather than memorization.
 # ---------------------------------------------------------------------------
 
-Template = Tuple[List[str], str]
+Template = tuple[list[str], str]
 
-SMELLY_TEMPLATES: Dict[str, List[Template]] = {
+SMELLY_TEMPLATES: dict[str, list[Template]] = {
     "PY-SMELL-002": [
         (["import urllib2"], "def {fn}({a}{ta}){rt}:\n    return urllib2.urlopen({a}).read()\n"),
         (["from urllib2 import urlopen"], "def {fn}({a}{ta}){rt}:\n    resp = urlopen({a})\n    return resp.read()\n"),
@@ -83,7 +83,7 @@ SMELLY_TEMPLATES: Dict[str, List[Template]] = {
     ],
 }
 
-HARD_NEGATIVE_TEMPLATES: List[Template] = [
+HARD_NEGATIVE_TEMPLATES: list[Template] = [
     (["import requests"], "def {fn}({a}{ta}){rt}:\n    return requests.get({a}).json()\n"),
     (["from requests import get"], "def {fn}({a}{ta}){rt}:\n    resp = get({a})\n    return resp.json()\n"),
     (["import requests"], "def {fn}({a}{ta}, {b}{tb}){rt}:\n    req = requests.Request({a}, data={b})\n    return requests.Session().send(req).json()\n"),
@@ -98,7 +98,7 @@ HARD_NEGATIVE_TEMPLATES: List[Template] = [
     (["import tomllib"], "def {fn}({a}{ta}){rt}:\n    return tomllib.loads({a})\n"),
 ]
 
-CLEAN_TEMPLATES: List[Template] = [
+CLEAN_TEMPLATES: list[Template] = [
     ([], "def {fn}({a}{ta}, {b}{tb}){rt}:\n    return {a} + {b}\n"),
     ([], "def {fn}({a}{ta}){rt}:\n    total = 0\n    for item in {a}:\n        total += item\n    return total\n"),
     ([], "def {fn}({a}{ta}){rt}:\n    return {a} % 2 == 0\n"),
@@ -116,7 +116,7 @@ PARAM_TYPES = [": str", ": bytes", ": int", ": list", ": dict", ": object"]
 RETURN_TYPES = [" -> object", " -> str", " -> int | None", " -> list", " -> None", " -> bytes"]
 
 
-def _render(template: Template, rng: random.Random, n: int, typed: bool, as_method: bool) -> Tuple[List[str], str]:
+def _render(template: Template, rng: random.Random, n: int, typed: bool, as_method: bool) -> tuple[list[str], str]:
     imports, body = template
     a, b = rng.sample(PARAM_NAMES, 2)
     source = body.format(
@@ -132,14 +132,14 @@ def _render(template: Template, rng: random.Random, n: int, typed: bool, as_meth
     return imports, source
 
 
-def generate_corpus(num_samples: int, seed: int) -> List[Tuple[str, List[float]]]:
+def generate_corpus(num_samples: int, seed: int) -> list[tuple[str, list[float]]]:
     """Returns [(source_code, multi_hot_label_vector), ...], labeled by the teacher."""
     rng = random.Random(seed)
     smell_ids = list(SMELLY_TEMPLATES.keys())
     samples = []
 
     for i in range(num_samples):
-        picks: List[Template] = []
+        picks: list[Template] = []
         num_smells = rng.choices([0, 1, 2, 3], weights=[0.3, 0.4, 0.2, 0.1])[0]
         for sid in rng.sample(smell_ids, k=num_smells):
             picks.append(rng.choice(SMELLY_TEMPLATES[sid]))
@@ -155,8 +155,8 @@ def generate_corpus(num_samples: int, seed: int) -> List[Tuple[str, List[float]]
         # Typing discipline is a per-file property in real code (fully typed,
         # mostly typed, mixed, untyped), not an independent coin flip per function.
         typed_rate = rng.choices([1.0, 0.9, 0.5, 0.0], weights=[0.45, 0.2, 0.2, 0.15])[0]
-        imports: List[str] = []
-        bodies: List[str] = []
+        imports: list[str] = []
+        bodies: list[str] = []
         for j, template in enumerate(picks):
             imps, src = _render(template, rng, i * 100 + j,
                                 typed=rng.random() < typed_rate, as_method=rng.random() < 0.25)
@@ -178,7 +178,7 @@ class _Counterfactual(ast.NodeTransformer):
 
     # Tried and rejected: an "annotate every def but one" / "exactly one bare
     # except" variant. It raised external 006 recall 0.88 -> 0.96 but its
-    # false-positive rate 2% -> 15% (see phases.md, Phase 5 evaluation).
+    # false-positive rate 2% -> 15% (see docs/design-history.md, Phase 5 evaluation).
     def __init__(self, rng: random.Random) -> None:
         self.annotate = rng.random() < 0.5
         self.strip = not self.annotate and rng.random() < 0.3
@@ -215,9 +215,9 @@ class _Counterfactual(ast.NodeTransformer):
         return node
 
 
-def _flatten_oversized(stmts: List[ast.stmt], max_nodes: int) -> List[ast.stmt]:
+def _flatten_oversized(stmts: list[ast.stmt], max_nodes: int) -> list[ast.stmt]:
     """Statements that fit in a chunk; oversized classes contribute their methods instead."""
-    out: List[ast.stmt] = []
+    out: list[ast.stmt] = []
     for stmt in stmts:
         size = sum(1 for _ in ast.walk(stmt))
         if size <= max_nodes:
@@ -227,9 +227,9 @@ def _flatten_oversized(stmts: List[ast.stmt], max_nodes: int) -> List[ast.stmt]:
     return out
 
 
-def _function_nodes(module: ast.Module) -> List[ast.AST]:
+def _function_nodes(module: ast.Module) -> list[ast.AST]:
     """Top-level functions and methods of top-level classes (what the codebase index localizes to)."""
-    out: List[ast.AST] = []
+    out: list[ast.AST] = []
     for node in module.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.append(node)
@@ -240,9 +240,9 @@ def _function_nodes(module: ast.Module) -> List[ast.AST]:
 
 def real_code_corpus(root: str, num_samples: int, seed: int, max_nodes: int = 2500,
                      augment: bool = False, functions_per_chunk: int = 0,
-                     exclude_dirs: Tuple[str, ...] = ("test", "tests", "site-packages", "lib2to3", "idlelib"),
-                     path_filter: Optional[Callable[[str], bool]] = None,
-                     ) -> List[Tuple[str, List[float], str]]:
+                     exclude_dirs: tuple[str, ...] = ("test", "tests", "site-packages", "lib2to3", "idlelib"),
+                     path_filter: Callable[[str], bool] | None = None,
+                     ) -> list[tuple[str, list[float], str]]:
     """
     Teacher-labeled chunks of real Python source under `root`. Each file's
     top-level statements are grouped into chunks of at most ~`max_nodes` AST
@@ -266,20 +266,20 @@ def real_code_corpus(root: str, num_samples: int, seed: int, max_nodes: int = 25
     rng = random.Random(seed)
     rng.shuffle(paths)
 
-    samples: List[Tuple[str, List[float], str]] = []
+    samples: list[tuple[str, list[float], str]] = []
     chunks = 0
     for path in paths:
         if chunks >= num_samples:
             break
         try:
-            with open(path, "r", encoding="utf-8") as f:
+            with open(path, encoding="utf-8") as f:
                 tree = ast.parse(f.read())
         except (SyntaxError, UnicodeDecodeError, ValueError, RecursionError, OSError):
             continue
 
-        chunk: List[ast.stmt] = []
+        chunk: list[ast.stmt] = []
         size = 0
-        for stmt in _flatten_oversized(tree.body, max_nodes) + [None]:
+        for stmt in [*_flatten_oversized(tree.body, max_nodes), None]:
             stmt_size = sum(1 for _ in ast.walk(stmt)) if stmt is not None else 0
             if chunk and (stmt is None or size + stmt_size > max_nodes):
                 try:
@@ -329,7 +329,7 @@ def stdlib_split(path: str) -> str:
     return "val" if b < 15 else "test" if b < 30 else "train"
 
 
-def list_packages(root: str) -> List[str]:
+def list_packages(root: str) -> list[str]:
     """Top-level importable packages (directories with Python files) under a site-packages dir."""
     out = []
     for name in sorted(os.listdir(root)):
@@ -342,11 +342,11 @@ def list_packages(root: str) -> List[str]:
 
 
 def package_corpus(split: str, chunks_per_package: int, seed: int, augment: bool,
-                   functions_per_chunk: int, root: Optional[str] = None) -> List[Tuple[str, List[float], str]]:
+                   functions_per_chunk: int, root: str | None = None) -> list[tuple[str, list[float], str]]:
     """Teacher-labeled chunks from every installed package assigned to `split`, capped per
     package so giants (torch, sympy, kubernetes) do not dominate."""
     root = root or site_packages_root()
-    samples: List[Tuple[str, List[float], str]] = []
+    samples: list[tuple[str, list[float], str]] = []
     for package in list_packages(root):
         if package_split(package) == split:
             for code, label, _ in real_code_corpus(os.path.join(root, package), chunks_per_package, seed,
@@ -386,7 +386,7 @@ def _f1(pred, target) -> float:
     return 2 * tp / (2 * tp + fp + fn) if tp else 0.0
 
 
-def calibrate_thresholds(probs, targets) -> Dict[str, float]:
+def calibrate_thresholds(probs, targets) -> dict[str, float]:
     """Per-label threshold maximizing F1 on the validation split (ties -> closest to 0.5)."""
     thresholds = {}
     for i, label in enumerate(SMELL_LABELS):
@@ -396,13 +396,13 @@ def calibrate_thresholds(probs, targets) -> Dict[str, float]:
     return thresholds
 
 
-def evaluate_split(probs, targets, thresholds: Dict[str, float]) -> Dict[str, object]:
+def evaluate_split(probs, targets, thresholds: dict[str, float]) -> dict[str, object]:
     """F1 per label; labels with no positives in the split get None (F1 undefined) and
     are excluded from macro-F1, with their false-positive rate reported instead."""
-    preds = (probs > probs.new_tensor([thresholds[l] for l in SMELL_LABELS])).float()
-    per_label: Dict[str, Optional[float]] = {}
-    fp_rate: Dict[str, float] = {}
-    support: Dict[str, int] = {}
+    preds = (probs > probs.new_tensor([thresholds[label] for label in SMELL_LABELS])).float()
+    per_label: dict[str, float | None] = {}
+    fp_rate: dict[str, float] = {}
+    support: dict[str, int] = {}
     for i, label in enumerate(SMELL_LABELS):
         positives = float(targets[:, i].sum())
         negatives = len(targets) - positives
@@ -411,7 +411,7 @@ def evaluate_split(probs, targets, thresholds: Dict[str, float]) -> Dict[str, ob
         fp_rate[label] = round(float((preds[:, i] * (1 - targets[:, i])).sum()) / negatives, 4) if negatives else 0.0
     supported = [f1 for f1 in per_label.values() if f1 is not None]
     # With a handful of positives a label's F1 is a coin flip; selection should ignore it.
-    reliable = [per_label[l] for l in SMELL_LABELS if support[l] >= MIN_SUPPORT_FOR_SELECTION]
+    reliable = [per_label[label] for label in SMELL_LABELS if support[label] >= MIN_SUPPORT_FOR_SELECTION]
     return {
         "macro_f1": round(sum(supported) / len(supported), 4) if supported else None,
         "reliable_macro_f1": round(sum(reliable) / len(reliable), 4) if reliable else None,
@@ -430,7 +430,7 @@ EVAL_SPLITS = ("val", "val_real", "test", "test_real", "test_external")
 
 
 def build_datasets(seed: int, num_samples: int = 2000, real_samples: int = 2000,
-                   package_chunks: int = 25) -> Dict[str, list]:
+                   package_chunks: int = 25) -> dict[str, list]:
     """
     Seeded PyG datasets, independent of model config (a sweep builds them once per seed):
       train          synthetic + stdlib train files + train packages (counterfactually augmented)
@@ -444,7 +444,7 @@ def build_datasets(seed: int, num_samples: int = 2000, real_samples: int = 2000,
     synthetic = generate_corpus(num_samples, seed)
     random.Random(seed).shuffle(synthetic)
     n_train, n_val = int(0.7 * len(synthetic)), int(0.15 * len(synthetic))
-    raw: Dict[str, List[Tuple[str, List[float]]]] = {
+    raw: dict[str, list[tuple[str, list[float]]]] = {
         "train": synthetic[:n_train], "val": synthetic[n_train:n_train + n_val],
         "test": synthetic[n_train + n_val:], "val_real": [], "test_real": [], "test_external": [],
     }
@@ -461,11 +461,11 @@ def build_datasets(seed: int, num_samples: int = 2000, real_samples: int = 2000,
             raw[f"{split}_real"].append((code, label))
 
     if package_chunks:
-        raw["train"] += [(c, l) for c, l, _ in package_corpus("train", package_chunks, seed, True, 2)]
-        val_pkgs = [(c, l) for c, l, _ in package_corpus("val", package_chunks, seed, False, 3)]
+        raw["train"] += [(c, labels) for c, labels, _ in package_corpus("train", package_chunks, seed, True, 2)]
+        val_pkgs = [(c, labels) for c, labels, _ in package_corpus("val", package_chunks, seed, False, 3)]
         raw["val"] += val_pkgs
         raw["val_real"] += val_pkgs
-        raw["test_external"] += [(c, l) for c, l, _ in package_corpus("test", package_chunks, seed, False, 3)]
+        raw["test_external"] += [(c, labels) for c, labels, _ in package_corpus("test", package_chunks, seed, False, 3)]
 
     seen = {hashlib.sha1(code.encode()).hexdigest() for code, _ in raw["train"]}
     for split in EVAL_SPLITS:
@@ -485,8 +485,8 @@ def resolve_device(device: str = "auto") -> str:
     return ("cuda" if torch.cuda.is_available() else "cpu") if device == "auto" else device
 
 
-def _train_member(config: GNNConfig, seed: int, datasets: Dict[str, list], device: str, lr: float,
-                  max_epochs: int, patience: int, log) -> Tuple[object, int]:
+def _train_member(config: GNNConfig, seed: int, datasets: dict[str, list], device: str, lr: float,
+                  max_epochs: int, patience: int, log) -> tuple[object, int]:
     """Trains one model with early stopping on validation BCE; returns (best model, epochs run)."""
     import torch
     from torch_geometric.loader import DataLoader
@@ -537,8 +537,8 @@ def _train_member(config: GNNConfig, seed: int, datasets: Dict[str, list], devic
 
 def run_training(config: GNNConfig, seed: int, num_samples: int = 2000, real_samples: int = 2000,
                  max_epochs: int = 80, patience: int = 10, save: bool = True, verbose: bool = True,
-                 datasets: Optional[Dict[str, list]] = None, ensemble: int = 1, lr: float = 2e-3,
-                 device: str = "auto", package_chunks: int = 25) -> Dict[str, object]:
+                 datasets: dict[str, list] | None = None, ensemble: int = 1, lr: float = 2e-3,
+                 device: str = "auto", package_chunks: int = 25) -> dict[str, object]:
     """
     Trains `ensemble` models (seeds seed..seed+ensemble-1) on the same data; thresholds are
     calibrated on the ensemble's averaged validation probabilities. Returns metrics for every
@@ -557,10 +557,11 @@ def run_training(config: GNNConfig, seed: int, num_samples: int = 2000, real_sam
         members.append(model)
         epochs.append(n_epochs)
 
-    loader = lambda name: DataLoader(datasets[name], batch_size=64)
+    def loader(name):
+        return DataLoader(datasets[name], batch_size=64)
     val_probs, val_targets = _predict(members, loader("val"), device)
     thresholds = calibrate_thresholds(val_probs, val_targets)
-    metrics: Dict[str, object] = {"seed": seed, "ensemble": ensemble, "lr": lr, "epochs_trained": epochs,
+    metrics: dict[str, object] = {"seed": seed, "ensemble": ensemble, "lr": lr, "epochs_trained": epochs,
                                   "num_samples": num_samples, "real_samples": real_samples,
                                   "package_chunks": package_chunks, "split_sizes": {k: len(v) for k, v in datasets.items()}}
     for name in EVAL_SPLITS:
@@ -577,7 +578,7 @@ def run_training(config: GNNConfig, seed: int, num_samples: int = 2000, real_sam
     return metrics
 
 
-def main(argv: Optional[List[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--conv", choices=["gcn", "sage", "sage_max", "gin"])
     parser.add_argument("--layers", type=int)
@@ -603,8 +604,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.no_tokens:
         overrides["use_tokens"] = False
     config = replace(GNNConfig(), **overrides)
-    common = dict(num_samples=args.samples, real_samples=args.real_samples, package_chunks=args.package_chunks,
-                  lr=args.lr, device=args.device)
+    common = {"num_samples": args.samples, "real_samples": args.real_samples, "package_chunks": args.package_chunks,
+                  "lr": args.lr, "device": args.device}
 
     if args.sweep:
         runs = [run_training(config, s, save=False, verbose=False, **common) for s in args.sweep]

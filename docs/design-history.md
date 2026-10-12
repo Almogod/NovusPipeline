@@ -1,4 +1,6 @@
-# NovusPipeline Implementation Phases
+# NovusPipeline Design History
+
+_A chronological record of design decisions and evaluation results. File names and counts reflect the state at each phase; see the README and docs/architecture.md for the current design._
 
 ## Phase 1: Local MCP Scaffolding (COMPLETED)
 - [x] Initialize Python virtual environment (`.venv`) and install `fastmcp`, `pydantic`, `gitpython`, `chromadb`.
@@ -303,3 +305,115 @@ validated by the synthetic and contrast suites (all pass).
   up the PyPI trusted publisher, push and tag `v0.1.0`, then register with the
   MCP Registry (`mcp-publisher init` / `publish`; README carries the
   `mcp-name` marker).
+
+## Phase 9: Broader Detection, True Sandbox, Learning From History (COMPLETED)
+
+### Ruff as detection and safe-fix backend (`ruff_backend.py`)
+- [x] Ruff (dependency `ruff>=0.6`) scans every indexed file and every audit:
+  pyupgrade, bandit, bugbear, pyflakes, pathlib, comprehensions, simplify,
+  perflint, syntax errors. Noisy rules for legacy code are ignored (bare-except
+  is already a built-in rule; `assert`, subprocess and random warnings).
+- [x] Only Ruff's safe fixes (UP, C4, PIE, SIM) are applied by the modernizer,
+  after the built-in rewrites; LLM proposals are rejected if they introduce new
+  HIGH/CRITICAL Ruff findings (e.g. undefined names, F821).
+
+### Codebase-level smells (`codebase_context.py`, `code_facts.py`)
+- [x] `CTX-CYCLE` (import-time cycles only; lazy imports inside functions don't
+  count), `CTX-DEAD` (unreferenced top-level definitions; decorated, exported,
+  entry points, dunder and `main` are exempt), `CTX-CLONE` (rename-insensitive
+  structural hash, >= 40 AST nodes), `CTX-UNTESTED` (risky, depended-on files
+  with no related tests), `CTX-GOD` (fan-in, fan-out and size together),
+  `CTX-DEPRECATED` (`.novus/config.toml` `[deprecated]`), `CTX-DYNAMIC`.
+- [x] Risk score is severity-weighted across rules, Ruff, GNN, codebase-level
+  and learned smells; each smell id counts once.
+- [x] On this repository: found the one truly unused function (`encode_graph`)
+  and the two modules with no tests; no dead-code false positives on the
+  decorator-registered MCP tools.
+
+### Dynamic imports
+- [x] Resolved into the import graph: `importlib.import_module` (absolute and
+  relative with `package=__name__`/`__package__`), `__import__`, `runpy`,
+  spec loaders from file paths, aliases bound from `import_module`, and
+  `getattr(module, "literal")` as symbol usage; star imports honor `__all__`.
+- [x] Unresolvable targets (e.g. f-strings) are reported as `CTX-DYNAMIC`, and
+  modules under their literal prefix are treated as reachable (no false dead code).
+
+### True sandbox (`sandbox.py`) and worktree pipeline
+- [x] Every test run: temporary project copy, allowlisted environment, home/temp
+  redirected, memory/process limits, whole-tree kill on timeout (Windows Job
+  Object created suspended so no child escapes; POSIX rlimits + process group),
+  network isolation on Linux via `unshare -rn`, Docker opt-in. Verified on
+  Windows: workspace writes don't reach the user's files, secrets are invisible,
+  300 MB limit raises MemoryError, timeout kills grandchildren, linked
+  `node_modules` survive cleanup.
+- [x] `run_autonomous_modernization_pipeline` is no longer destructive: it works
+  in a disposable worktree and only adds commits to a branch that isn't checked
+  out. It refuses files with uncommitted changes. PR drafts moved to
+  `.novus_index/prs/`. Together with the MCP annotations, clients can approve
+  every non-destructive tool once (README: "Approve once").
+
+### Learning smells from commit history (`history_learner.py`)
+- [x] Mines focused call/import replacements per changed function; rules need
+  >= 3 separate commits, >= 60% consistency, and no adoption of the old call
+  after the last replacement. Evidence (commits, messages) is attached to every
+  finding. Auto-fix only for argument-preserving renames with >= 90%
+  consistency that need no new import; applied by the test-gated pipeline.
+- [x] Incremental (`.novus_index/learned.json`), runs in the background after
+  each index refresh (`NOVUS_LEARN_FROM_HISTORY=0` disables), and on demand via
+  the new `learn_from_history` tool (22 tools now).
+- [x] Mining speed: one `git log --raw -M` plus a blob parse cache; the Inkscape
+  extensions repository (1553 Python-touching commits) mines in ~3 minutes
+  (was 8.5 minutes with per-commit diffs), re-runs in < 1 s.
+- [x] Time-split evaluation on Inkscape extensions: learned from the history up
+  to June 2019, then checked against what the developers did afterwards.
+  | Learned rule (before T) | Uses at T | Uses at HEAD | Auto-fix |
+  |---|---|---|---|
+  | `self.unittouu` -> `self.svg.unittouu` | 8 | 0 | yes |
+  | `self.xpathSingle` -> `self.svg.getElement` | 2 | 0 | yes |
+  | `self.selected.items` -> `self.svg.selected.items` | 3 | 0 | no (70% consistency) |
+  | `simpletransform.parseTransform` -> `Transform` | 5 | 3 | no (arguments change) |
+  | `simplestyle.parseStyle` -> `inkex.parseStyle` | 1 | 1 | no |
+  | import `lxml` -> `inkex.elements` | 70 files | 24 of 473 files | no |
+  Both auto-fixable rules were later fully applied by the team; 4 of the 5 call
+  rules with remaining uses were later acted on. The adoption filter removed the
+  one false positive (`self.assertEqual` -> `self._assertPath`, a test-helper
+  swap in 4 commits while `assertEqual` gained 600 new uses).
+- [x] Tests: 121 (Ruff, dynamic imports, context smells, sandbox protections,
+  worktree pipeline incl. CRLF and branch extension, learner mining, filters,
+  incrementality, findings in all tools, learned fix applied on a branch).
+
+### Known limitations
+- Learned rules cover call targets and imports, matched by dotted name (no type
+  inference): `self.x.load` and `other.load` are different calls.
+- Without Docker, Windows and macOS test runs have no network isolation, and
+  the sandbox does not stop tests from reading files by absolute path.
+- Clone detection is per function; near-duplicates with small edits are not found.
+
+## Phase 10: Organization & Industry Standards (COMPLETED)
+- [x] Rule packs (`standards.py`): TOML files of rules with detection (calls with
+  import aliases resolved, `require_keyword`, imports, masked regex), guideline,
+  automatic fix (`replace_call` adds the needed import, `replace_import` keeps
+  references working via `import new as old`, `add_keyword`, regex
+  `replacement`), severity, `enforce = warn|block`, and path scope. Invalid rules
+  are reported with the reason and skipped; a broken pack never breaks the server.
+- [x] Scopes: personal (user data dir) and project (`.novus/standards/`, shared
+  via git); built-in example packs `secure-defaults` and `python-312-ready`
+  installed by copying. Packs can add or ignore Ruff codes (e.g. a rule that
+  supersedes `S113` with a fix).
+- [x] Wired into every stage: audits (standards listed first, with their
+  guideline and enforcement), index and risk scores (source `standard`; the
+  index rebuilds when a pack changes), `query_rag_guidelines` /
+  `search_rag_by_id` (standards ranked with the same TF-IDF scoring), LLM prompt
+  (standards the file violates first), LLM validation (no new violations),
+  rule-based rewrites (standards' fixes applied last), and the pipeline (no
+  commit while a `block` rule is violated; prepared changes are listed).
+- [x] New tools: `list_modernization_standards`, `add_modernization_rule`,
+  `remove_modernization_rule`, `install_standard_pack`, `remove_rag_document`
+  (27 tools). `ingest_rag_document` accepts any category slug (e.g. `fintech`).
+- [x] Tests: 138 (+17: validation messages, alias resolution, keyword and
+  `**kwargs` handling, string/comment masking, import and regex fixes, path
+  scope, user scope, broken packs, hand-written packs protected, audit/overview/
+  RAG integration, Ruff superseding, apply, pipeline block and commit, LLM gate).
+- Limits: matching is by dotted name after alias resolution (no type
+  inference); `pattern` rules are line-based; fixes are syntactic and rely on
+  the tests for behavior.

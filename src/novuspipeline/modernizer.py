@@ -16,7 +16,7 @@ import ast
 import io
 import re
 import tokenize
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, ClassVar
 
 PYTHON_EXTENSIONS = (".py", ".pyw")
 SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
@@ -64,7 +64,7 @@ def mask_strings_and_comments(code: str) -> str:
     return "".join(chars)
 
 
-def _sub_outside_literals(pattern: str, repl, code: str, flags: int = re.MULTILINE) -> Tuple[str, int]:
+def _sub_outside_literals(pattern: str, repl, code: str, flags: int = re.MULTILINE) -> tuple[str, int]:
     """re.subn that only matches code, never text inside strings or comments."""
     masked = mask_strings_and_comments(code)
     matches = list(re.finditer(pattern, masked, flags))
@@ -74,14 +74,14 @@ def _sub_outside_literals(pattern: str, repl, code: str, flags: int = re.MULTILI
     return code, len(matches)
 
 
-def _parse(code: str) -> Optional[ast.AST]:
+def _parse(code: str) -> ast.AST | None:
     try:
         return ast.parse(code)
     except (SyntaxError, ValueError, RecursionError, MemoryError):
         return None
 
 
-def top_level_names(code: str, include_imports: bool = True) -> Optional[set]:
+def top_level_names(code: str, include_imports: bool = True) -> set | None:
     """
     Names a module defines (and, with `include_imports`, imports) at top level — what
     `from mod import x` can see. None if unparseable. Use include_imports=False for the
@@ -107,7 +107,7 @@ def top_level_names(code: str, include_imports: bool = True) -> Optional[set]:
     return names
 
 
-def missing_names(new_code: str, required: List[str]) -> List[str]:
+def missing_names(new_code: str, required: list[str]) -> list[str]:
     """Names in `required` (e.g. symbols other modules import) that `new_code` no longer provides."""
     names = top_level_names(new_code)
     if names is None or "*" in names:
@@ -136,7 +136,7 @@ def _missing_type_hints(node: ast.AST) -> bool:
 class LegacySmellDetector:
     """Scans code strings for enterprise legacy code smells."""
 
-    SMELL_PATTERNS = [
+    SMELL_PATTERNS: ClassVar[list[dict[str, Any]]] = [
         {
             "id": "PY-SMELL-001",
             "name": "Python 2 Print Statement / Missing Print Parentheses",
@@ -215,10 +215,10 @@ class LegacySmellDetector:
             "severity": "MEDIUM",
         },
     ]
-    _BY_ID = {p["id"]: p for p in SMELL_PATTERNS}
+    _BY_ID: ClassVar[dict[str, dict[str, Any]]] = {p["id"]: p for p in SMELL_PATTERNS}
 
     @classmethod
-    def _finding(cls, smell_id: str, line_number: int, line_content: str, file_path: str) -> Dict[str, Any]:
+    def _finding(cls, smell_id: str, line_number: int, line_content: str, file_path: str) -> dict[str, Any]:
         p = cls._BY_ID[smell_id]
         return {
             "smell_id": smell_id,
@@ -232,7 +232,7 @@ class LegacySmellDetector:
         }
 
     @classmethod
-    def scan_code(cls, code: str, file_path: str = "") -> List[Dict[str, Any]]:
+    def scan_code(cls, code: str, file_path: str = "") -> list[dict[str, Any]]:
         """Returns one finding per (smell, line), sorted by line number."""
         lower = file_path.lower()
         if lower.endswith(PYTHON_EXTENSIONS):
@@ -247,7 +247,7 @@ class LegacySmellDetector:
         masked = mask_strings_and_comments(code) if is_python else code
         original_lines = code.split("\n")
 
-        found: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        found: dict[tuple[str, int], dict[str, Any]] = {}
         for idx, line in enumerate(masked.split("\n"), 1):
             for p in cls.SMELL_PATTERNS:
                 if p["category"] not in categories or (tree is not None and p.get("ast_rule")):
@@ -309,7 +309,7 @@ class CodeModernizer:
     """
 
     @classmethod
-    def _migrate_urllib2(cls, code: str, changes: List[str]) -> str:
+    def _migrate_urllib2(cls, code: str, changes: list[str]) -> str:
         masked = mask_strings_and_comments(code)
         if "urllib2" not in masked:
             return code
@@ -324,7 +324,7 @@ class CodeModernizer:
             return code
 
         used = set(re.findall(r"\burllib2\.(\w+)", masked))
-        imports: List[str] = []
+        imports: list[str] = []
         if used - _URLLIB2_ERRORS or not used:
             imports.append("import urllib.request")
         if used & _URLLIB2_ERRORS:
@@ -355,7 +355,7 @@ class CodeModernizer:
         return code
 
     @classmethod
-    def _migrate_print_statements(cls, code: str, changes: List[str]) -> str:
+    def _migrate_print_statements(cls, code: str, changes: list[str]) -> str:
         masked_lines = mask_strings_and_comments(code).split("\n")
         lines = code.split("\n")
         converted = skipped = 0
@@ -383,9 +383,9 @@ class CodeModernizer:
         return "\n".join(lines)
 
     @classmethod
-    def modernize_python(cls, code: str) -> Tuple[str, List[str]]:
+    def modernize_python(cls, code: str) -> tuple[str, list[str]]:
         """Modernizes legacy Python code while preserving runtime behavior."""
-        changes: List[str] = []
+        changes: list[str] = []
         parsed_before = _parse(code) is not None
         updated = code
 
@@ -418,14 +418,20 @@ class CodeModernizer:
             changes.append("Manual review: pickle deserialization has no behavior-preserving automatic "
                            "replacement; migrate to json/pydantic by hand.")
 
+        if _parse(updated) is not None:
+            from . import ruff_backend
+            updated, fixed = ruff_backend.apply_safe_fixes(updated, "module.py")
+            if fixed:
+                changes.append(f"Applied Ruff safe fixes (behavior-preserving): {', '.join(fixed)}.")
+
         if parsed_before and _parse(updated) is None:
             return code, ["Aborted: transformed code no longer parses; original left unchanged."]
         return updated, changes
 
     @classmethod
-    def modernize_typescript(cls, code: str) -> Tuple[str, List[str]]:
+    def modernize_typescript(cls, code: str) -> tuple[str, list[str]]:
         """Modernizes legacy JavaScript/TypeScript code."""
-        changes: List[str] = []
+        changes: list[str] = []
         updated = code
 
         # `let`, not `const`: a `var` may be reassigned later.
@@ -433,7 +439,7 @@ class CodeModernizer:
             updated = re.sub(r"\bvar\s+", "let ", updated)
             changes.append("Replaced ES5 `var` with block-scoped `let`.")
 
-        for var_name, quote, mod_path in re.findall(r"const\s+(\w+)\s*=\s*require\((['\"])(.*?)\2\);?", updated):
+        for var_name, _quote, mod_path in re.findall(r"const\s+(\w+)\s*=\s*require\((['\"])(.*?)\2\);?", updated):
             for old in (f"const {var_name} = require('{mod_path}');", f'const {var_name} = require("{mod_path}");'):
                 if old in updated:
                     updated = updated.replace(old, f"import {var_name} from '{mod_path}';")

@@ -20,9 +20,10 @@ No dependency on torch, so graph construction is testable on its own.
 
 import ast
 import hashlib
-from typing import Any, Dict, List, Optional, Tuple
+import itertools
+from typing import Any
 
-NODE_TYPES: List[str] = [
+NODE_TYPES: list[str] = [
     "Module", "FunctionDef", "AsyncFunctionDef", "ClassDef", "Return",
     "Delete", "Assign", "AugAssign", "AnnAssign", "For", "AsyncFor",
     "While", "If", "With", "AsyncWith", "Raise", "Try", "TryStar",
@@ -38,10 +39,10 @@ NODE_TYPES: List[str] = [
     "In", "NotIn", "Is", "IsNot",
     "UNK",
 ]
-NODE_TYPE_TO_INDEX: Dict[str, int] = {name: i for i, name in enumerate(NODE_TYPES)}
+NODE_TYPE_TO_INDEX: dict[str, int] = {name: i for i, name in enumerate(NODE_TYPES)}
 UNK_INDEX = NODE_TYPE_TO_INDEX["UNK"]
 
-FIELD_NAMES: List[str] = [
+FIELD_NAMES: list[str] = [
     "<root>", "body", "orelse", "finalbody", "handlers", "test", "target",
     "targets", "value", "values", "iter", "args", "posonlyargs", "kwonlyargs",
     "vararg", "kwarg", "defaults", "kw_defaults", "returns", "annotation",
@@ -52,7 +53,7 @@ FIELD_NAMES: List[str] = [
     "subject", "cases", "pattern", "guard",
     "UNK",
 ]
-FIELD_TO_INDEX: Dict[str, int] = {name: i for i, name in enumerate(FIELD_NAMES)}
+FIELD_TO_INDEX: dict[str, int] = {name: i for i, name in enumerate(FIELD_NAMES)}
 FIELD_UNK_INDEX = FIELD_TO_INDEX["UNK"]
 
 # Bucket 0 = "node has no identifier"; 1..N-1 = md5-hashed identifiers. md5
@@ -70,7 +71,7 @@ def identifier_bucket(identifier: str) -> int:
     return 1 + int(digest, 16) % (NUM_TOKEN_BUCKETS - 1)
 
 
-def _node_identifier(node: ast.AST) -> Optional[str]:
+def _node_identifier(node: ast.AST) -> str | None:
     # User-chosen function/class/parameter names are deliberately excluded:
     # they carry no smell signal and would invite overfitting.
     if isinstance(node, ast.Name):
@@ -84,8 +85,8 @@ def _node_identifier(node: ast.AST) -> Optional[str]:
     return None
 
 
-def _children_with_fields(node: ast.AST) -> List[Tuple[ast.AST, str]]:
-    out: List[Tuple[ast.AST, str]] = []
+def _children_with_fields(node: ast.AST) -> list[tuple[ast.AST, str]]:
+    out: list[tuple[ast.AST, str]] = []
     for field, value in ast.iter_fields(node):
         if isinstance(value, ast.AST):
             out.append((value, field))
@@ -94,7 +95,7 @@ def _children_with_fields(node: ast.AST) -> List[Tuple[ast.AST, str]]:
     return out
 
 
-def build_graph_from_code(code: str) -> Dict[str, Any]:
+def build_graph_from_code(code: str) -> dict[str, Any]:
     """
     Parses `code` and returns a plain-dict graph:
       {
@@ -114,17 +115,17 @@ def build_graph_from_code(code: str) -> Dict[str, Any]:
     except (RecursionError, MemoryError) as e:
         raise ValueError(f"Source is too deeply nested to parse ({type(e).__name__}).") from e
 
-    node_type_ids: List[int] = []
-    node_field_ids: List[int] = []
-    node_token_ids: List[int] = []
-    node_features: List[List[float]] = []
-    edges: List[Tuple[int, int]] = []
+    node_type_ids: list[int] = []
+    node_field_ids: list[int] = []
+    node_token_ids: list[int] = []
+    node_features: list[list[float]] = []
+    edges: list[tuple[int, int]] = []
     # (parent_id, field) -> child ids in source order, for sibling edges
-    field_children: Dict[Tuple[int, str], List[int]] = {}
+    field_children: dict[tuple[int, str], list[int]] = {}
 
     # Explicit stack instead of recursion: long expression chains (e.g. a
     # 2000-term `a + b + ...`) parse fine but exceed Python's recursion limit.
-    stack: List[Tuple[ast.AST, int, str, int, int, int]] = [(tree, -1, "<root>", 0, 0, 1)]
+    stack: list[tuple[ast.AST, int, str, int, int, int]] = [(tree, -1, "<root>", 0, 0, 1)]
     while stack:
         node, parent_id, field, depth, sibling_index, num_siblings = stack.pop()
         this_id = len(node_type_ids)
@@ -154,7 +155,7 @@ def build_graph_from_code(code: str) -> Dict[str, Any]:
             stack.append((child, this_id, child_field, depth + 1, i, len(children)))
 
     for ids in field_children.values():
-        for a, b in zip(ids, ids[1:]):
+        for a, b in itertools.pairwise(ids):
             edges.append((a, b))
 
     if not edges:

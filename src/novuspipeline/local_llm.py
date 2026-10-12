@@ -18,6 +18,7 @@ introduce rule-engine smells, and must keep every symbol other modules import.
 Without a worker (or with NOVUS_FAST_TEST=1) the rule-based modernizer is used.
 """
 
+import contextlib
 import importlib.util
 import json
 import logging
@@ -29,7 +30,8 @@ import sys
 import tempfile
 import threading
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_BASE_MODEL = "unsloth/Qwen3.5-2B"
@@ -57,7 +59,7 @@ SYSTEM_PROMPT = (
 )
 
 
-def llm_python() -> Optional[str]:
+def llm_python() -> str | None:
     """Worker interpreter: NOVUS_LLM_PYTHON, a dev .venv-llm, this interpreter with [llm] installed, else None."""
     if os.environ.get("NOVUS_LLM_PYTHON"):
         return os.environ["NOVUS_LLM_PYTHON"]
@@ -75,8 +77,8 @@ class LLMWorker:
     """One persistent worker process; thread-safe; restarted if it dies, killed if it hangs."""
 
     def __init__(self) -> None:
-        self._proc: Optional[subprocess.Popen] = None
-        self._lines: "queue.Queue[str]" = queue.Queue()
+        self._proc: subprocess.Popen | None = None
+        self._lines: queue.Queue[str] = queue.Queue()
         self._lock = threading.Lock()
         self._next_id = 0
 
@@ -101,7 +103,7 @@ class LLMWorker:
     def running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def request(self, op: str, timeout: float, **payload: Any) -> Dict[str, Any]:
+    def request(self, op: str, timeout: float, **payload: Any) -> dict[str, Any]:
         with self._lock:
             if not self.running:
                 self._start()
@@ -114,7 +116,8 @@ class LLMWorker:
                     line = self._lines.get(timeout=timeout)
                 except queue.Empty:
                     self.stop()
-                    raise TimeoutError(f"LLM worker did not answer '{op}' within {timeout:.0f}s (worker restarted).")
+                    raise TimeoutError(
+                        f"LLM worker did not answer '{op}' within {timeout:.0f}s (worker restarted).") from None
                 if line == "":
                     self._proc = None
                     raise RuntimeError("LLM worker exited unexpectedly (out of memory?).")
@@ -124,20 +127,18 @@ class LLMWorker:
 
     def stop(self) -> None:
         if self._proc is not None:
-            try:
+            with contextlib.suppress(OSError):
                 self._proc.kill()
-            except OSError:
-                pass
             self._proc = None
 
 
 _WORKER = LLMWorker()
 
 
-def get_model_info(probe: bool = False) -> Dict[str, Any]:
+def get_model_info(probe: bool = False) -> dict[str, Any]:
     """Static configuration; with `probe`, starts the worker and loads the model to report device/VRAM."""
     adapter = adapter_path()
-    info: Dict[str, Any] = {
+    info: dict[str, Any] = {
         "adapter_path": adapter or None,
         "adapter_found": bool(adapter) and os.path.exists(os.path.join(adapter, "adapter_config.json")),
         "model_name": model_name(),
@@ -148,7 +149,7 @@ def get_model_info(probe: bool = False) -> Dict[str, Any]:
     }
     if info["adapter_found"]:
         try:
-            with open(os.path.join(adapter, "adapter_config.json"), "r", encoding="utf-8") as f:
+            with open(os.path.join(adapter, "adapter_config.json"), encoding="utf-8") as f:
                 cfg = json.load(f)
             info.update(base_model=cfg.get("base_model_name_or_path", info["base_model"]),
                         lora_rank=cfg.get("r"), lora_alpha=cfg.get("lora_alpha"),
@@ -166,7 +167,7 @@ def get_model_info(probe: bool = False) -> Dict[str, Any]:
     return info
 
 
-def generate_modernization_messages(legacy_code: str, rag_guidelines: str, codebase_context: str = "") -> List[Dict[str, str]]:
+def generate_modernization_messages(legacy_code: str, rag_guidelines: str, codebase_context: str = "") -> list[dict[str, str]]:
     context_block = f"\nCodebase context (dependents, public API, smell locations):\n{codebase_context}\n" \
         if codebase_context else ""
     user = (f"Modernization guidelines:\n{rag_guidelines}\n{context_block}\n"
@@ -180,11 +181,11 @@ def generate_modernization_prompt(legacy_code: str, rag_guidelines: str, codebas
                        for m in generate_modernization_messages(legacy_code, rag_guidelines, codebase_context))
 
 
-def extract_code(text: str) -> Optional[str]:
+def extract_code(text: str) -> str | None:
     """The model's code: the longest fenced block that parses, else the whole reply if it parses."""
     import ast
     blocks = re.findall(r"```(?:python|py)?[ \t]*\n(.*?)```", text, re.DOTALL)
-    for block in sorted(blocks, key=len, reverse=True) + [text]:
+    for block in [*sorted(blocks, key=len, reverse=True), text]:
         try:
             ast.parse(block)
             return block.rstrip() + "\n"
@@ -203,18 +204,38 @@ def _defined_callables(code: str) -> set:
     return {n.name for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))}
 
 
-def validate_proposal(original: str, proposed: Optional[str], required_names: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Gate for applying a proposal: parses, introduces no smells, keeps imported symbols."""
+def validate_proposal(original: str, proposed: str | None, required_names: list[str] | None = None,
+                      standards_scan: Callable[[str], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
+    """
+    Gate for applying a proposal: parses, introduces no smells (built-in rules, severe Ruff
+    findings, or violations of the organization's standards via `standards_scan`), keeps
+    imported symbols.
+    """
     from .modernizer import LegacySmellDetector, missing_names, top_level_names
 
     if proposed is None:
         return {"valid": False, "issues": ["No parseable Python code in the model output."]}
     before = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(original, "x.py"))
     after = Counter(f["smell_id"] for f in LegacySmellDetector.scan_code(proposed, "x.py"))
-    issues: List[str] = []
+    issues: list[str] = []
     introduced = sorted(s for s in after if after[s] > before.get(s, 0))
     if introduced:
         issues.append(f"Introduces smells: {', '.join(introduced)}")
+    # High-severity Ruff findings new in the proposal are the usual signature of a
+    # hallucination: undefined names (F821), insecure calls, syntax errors.
+    from . import ruff_backend
+    severe = lambda c: Counter(f["smell_id"] for f in ruff_backend.scan_code(c, "x.py")  # noqa: E731
+                               if f["severity"] in ("HIGH", "CRITICAL"))
+    ruff_before, ruff_after = severe(original), severe(proposed)
+    new_severe = sorted(s for s in ruff_after if ruff_after[s] > ruff_before.get(s, 0))
+    if new_severe:
+        issues.append(f"Introduces high-severity Ruff findings: {', '.join(new_severe)}")
+    if standards_scan is not None:
+        std_before = Counter(f["smell_id"] for f in standards_scan(original))
+        std_after = Counter(f["smell_id"] for f in standards_scan(proposed))
+        new_std = sorted(s for s in std_after if std_after[s] > std_before.get(s, 0))
+        if new_std:
+            issues.append(f"Violates organization standards: {', '.join(new_std)}")
     broken = missing_names(proposed, required_names or [])
     if broken:
         issues.append(f"Removes symbols other modules import: {', '.join(broken)}")
@@ -243,17 +264,19 @@ def _max_new_tokens(code: str) -> int:
 
 
 def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_context: str = "",
-                          required_names: Optional[List[str]] = None, adapter: bool = True) -> Dict[str, Any]:
+                          required_names: list[str] | None = None, adapter: bool = True,
+                          standards_scan: Callable[[str], list[dict[str, Any]]] | None = None) -> dict[str, Any]:
     """
     Structured LLM proposal: {"engine", "code", "raw", "validation", "stats", "error"}.
     Falls back to the rule-based modernizer when no worker is available.
     """
     from .modernizer import CodeModernizer
 
-    def rule_based(reason: str) -> Dict[str, Any]:
+    def rule_based(reason: str) -> dict[str, Any]:
         code, changes = CodeModernizer.modernize_python(legacy_code)
         return {"engine": "rule-based", "code": code, "raw": "\n".join(f"- {c}" for c in changes),
-                "validation": validate_proposal(legacy_code, code, required_names), "stats": {}, "error": reason}
+                "validation": validate_proposal(legacy_code, code, required_names, standards_scan), "stats": {},
+                "error": reason}
 
     if os.environ.get("NOVUS_FAST_TEST") == "1":
         return rule_based("NOVUS_FAST_TEST=1")
@@ -268,5 +291,6 @@ def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_contex
         return rule_based(resp.get("error", "worker error"))
     code = extract_code(resp["text"])
     return {"engine": f"{model_name()}{'' if adapter else ' (adapter disabled)'}", "code": code, "raw": resp["text"],
-            "validation": validate_proposal(legacy_code, code, required_names), "stats": resp.get("stats", {}),
+            "validation": validate_proposal(legacy_code, code, required_names, standards_scan),
+            "stats": resp.get("stats", {}),
             "error": None}

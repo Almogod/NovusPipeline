@@ -9,15 +9,16 @@ Usage:
     python -m novuspipeline.ingest_rag
 """
 
-import os
 import hashlib
 import math
+import os
 import re
 import sys
 from collections import Counter
 
 import chromadb
-from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
+from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
+
 
 def data_dir() -> str:
     """Per-user, writable tool data (installed packages may be read-only): NOVUS_DATA_DIR overrides."""
@@ -358,7 +359,7 @@ def seed_rag_database(reset: bool = True) -> None:
 
     collection.upsert(documents=documents, metadatas=metadatas, ids=ids)
 
-    categories = sorted(set(g["category"] for g in GUIDELINES))
+    categories = sorted({g["category"] for g in GUIDELINES})
     _safe_print(f"[NovusPipeline RAG] Ingested {len(documents)} guidelines.")
     _safe_print(f"[NovusPipeline RAG] Categories: {', '.join(categories)}")
     _safe_print(f"[NovusPipeline RAG] IDs: {', '.join(ids)}")

@@ -27,34 +27,32 @@ import os
 import random
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
 
-from . import gnn_model
-from . import train_gnn
+from . import gnn_model, train_gnn
 from .code_graph import build_graph_from_code
 
 LABELS = gnn_model.SMELL_LABELS
 BOOTSTRAP_ROUNDS = 1000
 
 
-def teacher_labels(code: str) -> Dict[str, int]:
+def teacher_labels(code: str) -> dict[str, int]:
     return dict(zip(LABELS, map(int, train_gnn.teacher_labels(code))))
 
 
-def thresholds() -> Dict[str, float]:
+def thresholds() -> dict[str, float]:
     return gnn_model.get_thresholds()
 
 
-def predictions(codes: List[str]) -> List[Optional[Dict[str, int]]]:
+def predictions(codes: list[str]) -> list[dict[str, int] | None]:
     """Thresholded ensemble predictions, batched; None where no graph could be built."""
     th = thresholds()
     out = []
     for res in gnn_model.analyze_many(codes):
-        out.append(None if res is None else {l: int(res["probs"][l] > th[l]) for l in LABELS})
+        out.append(None if res is None else {label: int(res["probs"][label] > th[label]) for label in LABELS})
     return out
 
 
-def prf(tp: int, fp: int, fn: int, negatives: int) -> Dict[str, float]:
+def prf(tp: int, fp: int, fn: int, negatives: int) -> dict[str, float]:
     precision = tp / (tp + fp) if tp + fp else 0.0
     recall = tp / (tp + fn) if tp + fn else 0.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
@@ -62,34 +60,34 @@ def prf(tp: int, fp: int, fn: int, negatives: int) -> Dict[str, float]:
             "support": tp + fn, "false_positive_rate": round(fp / negatives, 3) if negatives else 0.0}
 
 
-def _counts(pairs: List[Tuple[Dict[str, int], Dict[str, int]]], label: str) -> Tuple[int, int, int, int]:
+def _counts(pairs: list[tuple[dict[str, int], dict[str, int]]], label: str) -> tuple[int, int, int, int]:
     tp = sum(1 for p, t in pairs if p[label] and t[label])
     fp = sum(1 for p, t in pairs if p[label] and not t[label])
     fn = sum(1 for p, t in pairs if not p[label] and t[label])
     return tp, fp, fn, sum(1 for _, t in pairs if not t[label])
 
 
-def _macro(result: Dict) -> Optional[float]:
+def _macro(result: dict) -> float | None:
     # F1 is undefined for labels with no positives; those are judged by false_positive_rate.
-    supported = [l for l in LABELS if result[l]["support"]]
-    return round(sum(result[l]["f1"] for l in supported) / len(supported), 3) if supported else None
+    supported = [label for label in LABELS if result[label]["support"]]
+    return round(sum(result[label]["f1"] for label in supported) / len(supported), 3) if supported else None
 
 
-def score(samples: List[Tuple[str, Dict[str, int]]], bootstrap: bool = False) -> Dict:
+def score(samples: list[tuple[str, dict[str, int]]], bootstrap: bool = False) -> dict:
     preds = predictions([code for code, _ in samples])
     pairs = [(p, t) for p, (_, t) in zip(preds, samples) if p is not None]
-    result: Dict = {label: prf(*_counts(pairs, label)) for label in LABELS}
+    result: dict = {label: prf(*_counts(pairs, label)) for label in LABELS}
     result["macro_f1"] = _macro(result)
     result["samples"] = len(pairs)
     if bootstrap and pairs:
         rng = random.Random(0)
-        stats: Dict[str, List[float]] = {l: [] for l in LABELS + ["macro_f1"]}
+        stats: dict[str, list[float]] = {label: [] for label in [*LABELS, "macro_f1"]}
         for _ in range(BOOTSTRAP_ROUNDS):
             sample = [pairs[rng.randrange(len(pairs))] for _ in pairs]
             r = {label: prf(*_counts(sample, label)) for label in LABELS}
-            for l in LABELS:
-                if r[l]["support"]:
-                    stats[l].append(r[l]["f1"])
+            for label in LABELS:
+                if r[label]["support"]:
+                    stats[label].append(r[label]["f1"])
             m = _macro(r)
             if m is not None:
                 stats["macro_f1"].append(m)
@@ -102,7 +100,7 @@ def score(samples: List[Tuple[str, Dict[str, int]]], bootstrap: bool = False) ->
 # 1. In-distribution
 # ---------------------------------------------------------------------------
 
-def eval_in_distribution(n: int = 300) -> Dict:
+def eval_in_distribution(n: int = 300) -> dict:
     corpus = train_gnn.generate_corpus(num_samples=n, seed=987654)
     samples = [(code, dict(zip(LABELS, map(int, label)))) for code, label in corpus]
     return score(samples)
@@ -140,9 +138,9 @@ CONTRAST_CASES = [
 ]
 
 
-def eval_contrast() -> Dict:
+def eval_contrast() -> dict:
     th = thresholds()
-    per_label: Dict[str, List[int]] = {label: [] for label in LABELS}
+    per_label: dict[str, list[int]] = {label: [] for label in LABELS}
     cases = []
     for label, smelly, clean in CONTRAST_CASES:
         assert teacher_labels(smelly)[label] == 1 and teacher_labels(clean)[label] == 0, label
@@ -162,24 +160,24 @@ def eval_contrast() -> Dict:
 #    plus this repository's own Python files
 # ---------------------------------------------------------------------------
 
-_EXTERNAL_CACHE: Dict[str, list] = {}
+_EXTERNAL_CACHE: dict[str, list] = {}
 
 
-def external_chunks(chunks_per_package: int = 40) -> List[str]:
+def external_chunks(chunks_per_package: int = 40) -> list[str]:
     """Raw (unaugmented) chunks from the held-out test packages, cached for the run."""
     if "chunks" not in _EXTERNAL_CACHE:
         _EXTERNAL_CACHE["chunks"] = [c for c, _, _ in train_gnn.package_corpus("test", chunks_per_package, 2024, False, 0)]
     return _EXTERNAL_CACHE["chunks"]
 
 
-def eval_external_code() -> Dict:
+def eval_external_code() -> dict:
     report = score([(c, teacher_labels(c)) for c in external_chunks()], bootstrap=True)
     report["packages"] = [p for p in train_gnn.list_packages(train_gnn.site_packages_root())
                           if train_gnn.package_split(p) == "test"]
     return report
 
 
-def eval_external_functions(max_functions: int = 3000) -> Dict:
+def eval_external_functions(max_functions: int = 3000) -> dict:
     """Per-function agreement on held-out packages: what the codebase index's localization relies on."""
     samples = []
     for code in external_chunks():
@@ -210,7 +208,7 @@ class _RenameParameters(ast.NodeTransformer):
     visit_AsyncFunctionDef = visit_FunctionDef
 
 
-def eval_invariance(max_samples: int = 400) -> Dict:
+def eval_invariance(max_samples: int = 400) -> dict:
     """Fraction of held-out chunks whose predicted smell set survives each meaning-preserving rewrite."""
     rng = random.Random(7)
     chunks = external_chunks()[:max_samples]
@@ -250,13 +248,13 @@ def eval_invariance(max_samples: int = 400) -> Dict:
     return report
 
 
-def eval_real_code() -> Dict:
+def eval_real_code() -> dict:
     root = os.path.dirname(os.path.abspath(__file__))
     files = sorted(p for p in glob.glob(os.path.join(root, "*.py")))
     samples, per_file = [], []
     th = thresholds()
     for path in files:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             code = f.read()
         truth = teacher_labels(code)
         probs = gnn_model.predict_smells(code)
@@ -264,8 +262,8 @@ def eval_real_code() -> Dict:
         per_file.append({
             "file": os.path.basename(path),
             "nodes": build_graph_from_code(code)["num_nodes"],
-            "teacher": [l for l in LABELS if truth[l]],
-            "gnn": [l for l in LABELS if probs[l] > th[l]],
+            "teacher": [label for label in LABELS if truth[label]],
+            "gnn": [label for label in LABELS if probs[label] > th[label]],
         })
     return {"metrics": score(samples), "files": per_file}
 
@@ -281,8 +279,8 @@ _NEEDLES = {
 }
 
 
-def eval_needle(sizes=(0, 5, 20, 50, 100, 250)) -> Dict:
-    out: Dict[str, List[Dict]] = {}
+def eval_needle(sizes=(0, 5, 20, 50, 100, 250)) -> dict:
+    out: dict[str, list[dict]] = {}
     for label, needle in _NEEDLES.items():
         rows = []
         for n in sizes:
@@ -300,7 +298,7 @@ def eval_needle(sizes=(0, 5, 20, 50, 100, 250)) -> Dict:
 # 5. Scale & robustness
 # ---------------------------------------------------------------------------
 
-def eval_scale() -> Dict:
+def eval_scale() -> dict:
     latency = []
     for n in (10, 100, 1000, 3000):
         code = "\n".join(_CLEAN_FN.format(n=i) for i in range(n))

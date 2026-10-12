@@ -1,14 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Environments
 .venv/
 .venv-llm/
-__pycache__/
-*.pyc
-.chroma_db/
-.gnn_model/
+venv/
+
+# Tool caches and coverage
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# NovusPipeline runtime state and local evaluation output
 .novus_index/
+.gnn_model/
 .llm_eval/
+.chroma_db/
+reports/
 src/novuspipeline/models/eval_report.json
-dist/
-build/
-*.egg-info/
 *.bak
-.novus_pr_*.md
+*.tmp
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
