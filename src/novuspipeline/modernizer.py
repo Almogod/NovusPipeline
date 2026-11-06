@@ -419,6 +419,11 @@ class CodeModernizer:
                            "replacement; migrate to json/pydantic by hand.")
 
         if _parse(updated) is not None:
+            from . import codemods
+            updated, notes = codemods.apply(updated)
+            changes.extend(notes)
+
+        if _parse(updated) is not None:
             from . import ruff_backend
             updated, fixed = ruff_backend.apply_safe_fixes(updated, "module.py")
             if fixed:

@@ -1,0 +1,14 @@
+- id: novuspipeline-scan
+  name: NovusPipeline scan
+  description: Fail on legacy code, removed APIs and standards violations (set --fail-on via args).
+  entry: novuspipeline scan --fail-on high
+  language: python
+  types: [python]
+  require_serial: true
+- id: novuspipeline-fix
+  name: NovusPipeline fix
+  description: Apply behavior-preserving modernizations; fails if anything changed so you can review.
+  entry: novuspipeline fix --force
+  language: python
+  types: [python]
+  require_serial: true

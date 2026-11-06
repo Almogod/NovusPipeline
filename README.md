@@ -21,6 +21,26 @@ Requires Python 3.11+. The server runs on your machine and is launched by your M
 
 On Linux, install CPU torch first to avoid a multi-GB CUDA download: `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
 
+## Use it without an MCP client (CLI, CI, pre-commit)
+
+```bash
+novuspipeline scan src/                          # findings: built-in rules, migrations, Ruff, your standards
+novuspipeline scan --format sarif > out.sarif    # GitHub code scanning (also: --format json, --fail-on high)
+novuspipeline fix --diff                         # preview the behavior-preserving rewrites
+novuspipeline fix --test-cmd "python -m pytest"  # apply, run the tests in the sandbox, revert everything if they fail
+novuspipeline fix --check                        # CI: exit 1 if anything is still fixable
+novuspipeline migrations                         # list the library/language migrations
+```
+
+`fix` skips files with uncommitted changes (use `--force` to override) and keeps line endings. In GitHub Actions:
+
+```yaml
+- uses: Almogod/NovusPipeline@main
+  with: { path: src, fail-on: high }   # uploads SARIF to code scanning (needs security-events: write)
+```
+
+For pre-commit, use the `novuspipeline-scan` / `novuspipeline-fix` hooks from this repository.
+
 ## Connect your MCP client
 
 Claude Desktop (`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`) and similar clients:
@@ -141,6 +161,7 @@ You can also do all of this through your assistant:
 | Source | Examples |
 |---|---|
 | Your standards | whatever your rule packs define (see above) |
+| Migrations (libcst) | removed or deprecated stdlib APIs: `unittest` aliases (`assertEquals`, removed in 3.12), `collections.Mapping` etc. (3.10), `base64.encodestring` (3.9), `logging.warn` (3.13); detect-only: `inspect.getargspec`, `datetime.utcnow`, `ssl.wrap_socket`, ... Fixes keep comments and formatting; add your own by subclassing `codemods.Migration` |
 | Built-in legacy rules | Python 2 print and `urllib2`, bare `except`, `os.popen`, unsafe `pickle`, missing type hints (plus ES5 `var`, `any`, `require()` in TypeScript/JavaScript) |
 | Ruff | pyupgrade, bugbear, security (bandit), pathlib, comprehension and simplification rules; safe fixes are applied automatically |
 | Structural GNN (`[gnn]`) | the same smells from AST shape, localized to functions; structurally similar code |

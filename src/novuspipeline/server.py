@@ -26,7 +26,7 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
 
-from . import codebase_context, gnn_model, history_learner, local_llm, ruff_backend, sandbox, standards
+from . import codebase_context, codemods, gnn_model, history_learner, local_llm, ruff_backend, sandbox, standards
 from .ingest_rag import CHROMA_DIR, COLLECTION_NAME, ensure_seeded, get_collection
 from .ingest_rag import similarity_from_distance as ingest_rag_similarity
 from .modernizer import CodeModernizer, LegacySmellDetector, missing_names
@@ -719,6 +719,8 @@ def analyze_legacy_codebase(file_path: str) -> str:
             return code
 
         findings = LegacySmellDetector.scan_code(code, file_path)
+        if file_path.endswith(".py"):
+            findings += codemods.scan(code, file_path)  # library/language migrations (libcst)
         ruff_findings = ruff_backend.scan_code(code, file_path, *_ruff_settings())
         learned = history_learner.get_learner(WORKSPACE_ROOT).scan(code, file_path) if file_path.endswith(".py") else []
         active = _standards()
@@ -739,7 +741,7 @@ def analyze_legacy_codebase(file_path: str) -> str:
             for f in sorted(standard_findings, key=by_severity) + findings + sorted(ruff_findings, key=by_severity) \
                     + learned:
                 by_smell.setdefault(f["smell_id"], []).append(f)
-            safe = sum(1 for f in ruff_findings + learned + standard_findings if f["fix"] == "safe")
+            safe = sum(1 for f in findings + ruff_findings + learned + standard_findings if f.get("fix") == "safe")
             total = len(findings) + len(ruff_findings) + len(learned) + len(standard_findings)
             blocking = sum(1 for f in standard_findings if f["enforce"] == "block")
             report.append(f"Found **{total}** finding(s) of **{len(by_smell)}** kind(s) "

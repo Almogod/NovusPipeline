@@ -33,6 +33,7 @@ dependencies = [
     "pydantic>=2,<3",
     "platformdirs>=4",
     "ruff>=0.6",
+    "libcst>=1.1,<2",
 ]
 
 [project.optional-dependencies]
@@ -45,7 +46,7 @@ llm = ["torch>=2.4", "transformers>=5.0", "peft>=0.18", "accelerate>=1.0", "safe
 all = ["novuspipeline[gnn,llm]"]
 
 [project.scripts]
-novuspipeline = "novuspipeline.server:main"
+novuspipeline = "novuspipeline.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/Almogod/NovusPipeline"

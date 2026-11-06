@@ -15,7 +15,7 @@ from test_server import WorkspaceTestCase  # also applies the test environment s
 CLIENT = "class client:\n    @staticmethod\n    def get_json(n):\n        return n + 1\n"
 
 
-def test_module(n: int, call: str = "client.fetch_json") -> str:
+def make_test_module(n: int, call: str = "client.fetch_json") -> str:
     # A team-specific API rename that no built-in rule or Ruff knows about.
     return (f"import unittest\n\nfrom api import client\n\n\nclass T{n}(unittest.TestCase):\n"
             f"    def test_a(self):\n        self.assertEqual({call}({n}), {n + 1})\n\n"
@@ -55,9 +55,9 @@ class LearnerTestCase(WorkspaceTestCase):
 
     def build_history(self) -> None:
         """Four test modules; the team replaces fetch_json in three separate commits."""
-        self.commit({"api.py": CLIENT, **{f"test_m{i}.py": test_module(i) for i in range(4)}}, "add tests")
+        self.commit({"api.py": CLIENT, **{f"test_m{i}.py": make_test_module(i) for i in range(4)}}, "add tests")
         for i in range(3):
-            self.commit({f"test_m{i}.py": test_module(i, "client.get_json")}, f"tests: use get_json in m{i}")
+            self.commit({f"test_m{i}.py": make_test_module(i, "client.get_json")}, f"tests: use get_json in m{i}")
 
 
 class TestLearning(LearnerTestCase):
@@ -70,8 +70,8 @@ class TestLearning(LearnerTestCase):
         self.assertIn("tests: use get_json in m", out)
 
     def test_one_large_commit_does_not_create_a_rule(self):
-        self.commit({f"test_m{i}.py": test_module(i) for i in range(4)}, "add tests")
-        self.commit({f"test_m{i}.py": test_module(i, "client.get_json") for i in range(4)}, "mass rename")
+        self.commit({f"test_m{i}.py": make_test_module(i) for i in range(4)}, "add tests")
+        self.commit({f"test_m{i}.py": make_test_module(i, "client.get_json") for i in range(4)}, "mass rename")
         self.assertIn("0 rule(s)", learn_from_history())
 
     def test_argument_changes_are_suggestions_only(self):
@@ -107,7 +107,7 @@ class TestLearning(LearnerTestCase):
         first = learner.refresh()
         self.assertEqual(first["mined"], first["total_commits"])
         self.assertEqual(learner.refresh()["mined"], 0)
-        self.commit({"test_m3.py": test_module(3, "client.get_json")}, "last one")
+        self.commit({"test_m3.py": make_test_module(3, "client.get_json")}, "last one")
         self.assertEqual(learner.refresh()["mined"], 1)
         # State survives a restart.
         self.assertEqual(HistoryLearner(self.root).state["mined_commits"], first["total_commits"] + 1)

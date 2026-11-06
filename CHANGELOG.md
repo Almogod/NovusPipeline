@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Command line interface: `novuspipeline scan` (text, JSON or SARIF; `--fail-on`), `fix`
+  (`--diff`, `--check`, `--test-cmd` to revert everything when sandboxed tests fail) and
+  `migrations`. Plain `novuspipeline` still starts the MCP server.
+- GitHub Action (`action.yml`, uploads SARIF to code scanning) and pre-commit hooks.
+- `codemods.py`: libcst-based, formatting-preserving migration framework with six migrations
+  (unittest aliases, `collections` ABCs, `base64`, `logging.warn`, removed stdlib APIs,
+  naive UTC datetimes). Fixes run in the modernizer and pipeline; findings appear in audits,
+  the codebase index and the CLI.
+
+### Changed
+- `libcst` is now a core dependency.
+- Tests run under both `unittest` and `pytest`.
+
 ## [0.1.0]
 
 First public release.

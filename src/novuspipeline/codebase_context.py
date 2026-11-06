@@ -32,7 +32,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
-from . import gnn_model, history_learner, ruff_backend, standards
+from . import codemods, gnn_model, history_learner, ruff_backend, standards
 from .code_facts import dotted, extract_defs, extract_exports, extract_imports, extract_refs, function_shape
 from .modernizer import LegacySmellDetector
 
@@ -217,7 +217,7 @@ class CodebaseIndex:
                 parts.append(f"{rel}:{os.path.getmtime(os.path.join(self.root, rel))}")
             except OSError:
                 parts.append(f"{rel}:-")
-        return "|".join(parts) + f"|ruff:{ruff_backend.available()[0]}|standards:{standards.signature(self.root)}"
+        return "|".join(parts) + f"|ruff:{ruff_backend.available()[0]}|migrations:{','.join(sorted(codemods.REGISTRY))}|standards:{standards.signature(self.root)}"
 
     def _read_config(self) -> None:
         cfg = _read_toml(os.path.join(self.root, CONFIG_PATH))
@@ -238,7 +238,9 @@ class CodebaseIndex:
                                "name": f["name"], "source": "rules"}
                               for f in LegacySmellDetector.scan_code(code, rel)]
             + [{"smell_id": f["smell_id"], "line": f["line_number"], "severity": f["severity"], "name": f["name"],
-                "source": "standard", "fix": f["fix"]} for f in standards.load(self.root).scan(code, rel)],
+                "source": "standard", "fix": f["fix"]} for f in standards.load(self.root).scan(code, rel)]
+            + [{"smell_id": f["smell_id"], "line": f["line_number"], "severity": f["severity"], "name": f["name"],
+                "source": "migration", "fix": f["fix"]} for f in codemods.scan(code, rel)],
         }
         try:
             tree = ast.parse(code)
