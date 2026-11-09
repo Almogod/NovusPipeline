@@ -707,12 +707,13 @@ class TestMcpProtocol(WorkspaceTestCase):
             transport = StdioTransport(command=sys.executable, args=["-m", "novuspipeline"], cwd=repo, env=env)
             async with Client(transport) as client:
                 tools = {t.name: t for t in await client.list_tools()}
-                self.assertEqual(len(tools), 27)
+                self.assertEqual(len(tools), 28)
                 self.assertTrue(tools["get_file_context"].annotations.read_only_hint)
                 # The pipeline works in a disposable worktree (only adds a branch); direct edits are destructive.
                 self.assertFalse(tools["run_autonomous_modernization_pipeline"].annotations.destructive_hint)
                 self.assertFalse(tools["run_autonomous_modernization_pipeline"].annotations.read_only_hint)
                 self.assertTrue(tools["apply_code_modernization"].annotations.destructive_hint)
+                self.assertFalse(tools["run_modernization_campaign"].annotations.destructive_hint)
                 self.assertIn("files", tools["create_git_migration_pr"].input_schema["properties"])
                 self.assertIn("use_llm", tools["run_autonomous_modernization_pipeline"].input_schema["properties"])
 

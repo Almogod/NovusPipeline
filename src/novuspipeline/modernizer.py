@@ -383,8 +383,8 @@ class CodeModernizer:
         return "\n".join(lines)
 
     @classmethod
-    def modernize_python(cls, code: str) -> tuple[str, list[str]]:
-        """Modernizes legacy Python code while preserving runtime behavior."""
+    def modernize_python(cls, code: str, migrations: dict[str, Any] | None = None) -> tuple[str, list[str]]:
+        """Modernizes legacy Python code while preserving runtime behavior (`migrations`: codemods selection)."""
         changes: list[str] = []
         parsed_before = _parse(code) is not None
         updated = code
@@ -420,7 +420,7 @@ class CodeModernizer:
 
         if _parse(updated) is not None:
             from . import codemods
-            updated, notes = codemods.apply(updated)
+            updated, notes = codemods.apply(updated, **(migrations or {}))
             changes.extend(notes)
 
         if _parse(updated) is not None:

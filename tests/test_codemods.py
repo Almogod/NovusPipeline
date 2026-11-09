@@ -65,6 +65,79 @@ class TestSmallMigrations(unittest.TestCase):
         self.assertTrue(all(f["fix"] is None for f in found))
 
 
+class TestRenamedApis(unittest.TestCase):
+    ID = ("MIG-RENAMED-APIS",)
+
+    def test_cross_module_rename_adds_import_and_drops_removed_module(self):
+        out = rewrite("import imp\n\nimp.reload(m)\n", list(self.ID))
+        self.assertEqual(out, "import importlib\n\nimportlib.reload(m)\n")
+
+    def test_removed_module_import_kept_while_still_used(self):
+        out = rewrite("import imp\nimp.reload(m)\nimp.load_source('a', 'b')\n", list(self.ID))
+        self.assertEqual(out, "import imp\nimport importlib\nimportlib.reload(m)\nimp.load_source('a', 'b')\n")
+
+    def test_from_import_keeps_local_name(self):
+        out = rewrite("from configparser import SafeConfigParser, RawConfigParser\np = SafeConfigParser()\n",
+                      list(self.ID))
+        self.assertEqual(out, "from configparser import ConfigParser as SafeConfigParser\n"
+                              "from configparser import RawConfigParser\np = SafeConfigParser()\n")
+
+    def test_module_rename_with_and_without_alias(self):
+        self.assertEqual(rewrite("import xml.etree.cElementTree as ET\n", list(self.ID)),
+                         "import xml.etree.ElementTree as ET\n")
+        self.assertEqual(rewrite("import xml.etree.cElementTree\nxml.etree.cElementTree.parse(f)\n", list(self.ID)),
+                         "import xml.etree.ElementTree\nxml.etree.ElementTree.parse(f)\n")
+        self.assertEqual(rewrite("from xml.etree.cElementTree import parse\n", list(self.ID)),
+                         "from xml.etree.ElementTree import parse\n")
+
+    def test_nested_attribute_path(self):
+        self.assertEqual(rewrite("import asyncio\nasyncio.Task.current_task()\n", list(self.ID)),
+                         "import asyncio\nasyncio.current_task()\n")
+
+    def test_unbound_name_is_not_rewritten(self):
+        src = "def f(logging):\n    logging.warn('x')\n"
+        self.assertEqual(rewrite(src, list(self.ID)), src)
+
+
+class TestCgiEscape(unittest.TestCase):
+    ID = ("MIG-CGI-ESCAPE",)
+
+    def test_default_quote_is_preserved(self):
+        self.assertEqual(rewrite("import cgi\ny = cgi.escape(x)\n", list(self.ID)),
+                         "import html\ny = html.escape(x, quote=False)\n")
+
+    def test_quote_true_is_detect_only(self):
+        src = "import cgi\ny = cgi.escape(x, True)\n"
+        self.assertEqual(rewrite(src, list(self.ID)), src)
+        self.assertEqual([f["fix"] for f in codemods.scan(src, "a.py", only=list(self.ID))], [None])
+
+
+class TestDetection(unittest.TestCase):
+    def test_removed_modules_skip_import_guards(self):
+        src = "import distutils.core\ntry:\n    import telnetlib\nexcept ImportError:\n    telnetlib = None\n"
+        found = codemods.scan(src, "a.py", only=["MIG-REMOVED-MODULES"])
+        self.assertEqual([f["line_number"] for f in found], [1])
+
+    def test_aliases_are_resolved(self):
+        found = codemods.scan("from inspect import getargspec as gas\ngas(f)\n", "a.py", only=["MIG-REMOVED-APIS"])
+        self.assertEqual([f["line_number"] for f in found], [1, 2])
+
+    def test_attribute_names_are_not_confused_with_imports(self):
+        src = "from inspect import getargspec\nself.getargspec()\n"
+        found = codemods.scan(src, "a.py", only=["MIG-REMOVED-APIS"])
+        self.assertEqual([f["line_number"] for f in found], [1])
+
+    def test_library_rules_need_the_library(self):
+        self.assertEqual(codemods.scan("x.parse_obj(1)\n", "a.py", only=["MIG-PYDANTIC-V2"]), [])
+        found = codemods.scan("import pydantic\nM.parse_obj(1)\n", "a.py", only=["MIG-PYDANTIC-V2"])
+        self.assertEqual([f["line_number"] for f in found], [2])
+
+    def test_naive_utcnow_through_from_import(self):
+        found = codemods.scan("from datetime import datetime\ndatetime.utcnow()\n", "a.py",
+                              only=["MIG-DATETIME-UTCNOW"])
+        self.assertEqual([f["line_number"] for f in found], [2])
+
+
 class TestRobustness(unittest.TestCase):
     def test_unparseable_python_is_left_alone(self):
         src = "print 'hello'\nself.assertEquals(1)\n"
@@ -82,7 +155,7 @@ class TestRobustness(unittest.TestCase):
     def test_modernizer_applies_migrations(self):
         out, notes = CodeModernizer.modernize_python("import logging\nlogging.warn('x')\n")
         self.assertIn("logging.warning('x')", out)
-        self.assertTrue(any("MIG-LOGGING-WARN" in n for n in notes))
+        self.assertTrue(any("MIG-RENAMED-APIS" in n for n in notes))
 
     def test_custom_migration_registers_itself(self):
         class Demo(codemods.Migration):

@@ -23,6 +23,8 @@ Add your own by subclassing `Migration`; it registers itself.
 
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -52,9 +54,17 @@ if cst is not None:
         id: ClassVar[str] = ""
         title: ClassVar[str] = ""
         severity: ClassVar[str] = "MEDIUM"
-        min_python: ClassVar[str | None] = None   # Python version in which the old API is removed
+        min_python: ClassVar[str | None] = None   # earliest Python version in which a covered API is removed
         guideline: ClassVar[str] = ""
         rag_query: ClassVar[str] = "Python Library Modernization"
+        pack: ClassVar[str] = "stdlib"            # group for --pack selection (stdlib, pydantic, sqlalchemy, ...)
+        fixable: ClassVar[bool] = True            # False: detection only
+        triggers: ClassVar[tuple[str, ...]] = ()  # substrings one of which must occur in the source (speed)
+
+        @classmethod
+        def relevant(cls, code: str) -> bool:
+            """Cheap pre-check before parsing: can this migration find anything in `code`?"""
+            return not cls.triggers or any(t in code for t in cls.triggers)
 
         def __init_subclass__(cls, **kwargs: Any) -> None:
             super().__init_subclass__(**kwargs)
@@ -142,6 +152,8 @@ _UNITTEST_ALIASES = {
 
 class UnittestAliases(Migration):
     id = "MIG-UNITTEST-ALIASES"
+    pack = "unittest"
+    triggers = tuple(_UNITTEST_ALIASES)
     title = "Deprecated unittest assertion aliases (removed in Python 3.12)"
     severity = "HIGH"
     min_python = "3.12"
@@ -188,6 +200,7 @@ _COLLECTIONS_ABC = {
 
 class CollectionsAbc(Migration):
     id = "MIG-COLLECTIONS-ABC"
+    triggers = ("collections",)
     title = "Abstract base classes imported from `collections` (removed in Python 3.10)"
     severity = "HIGH"
     min_python = "3.10"
@@ -244,62 +257,307 @@ class CollectionsAbc(Migration):
         return module
 
 
-class Base64Legacy(Migration):
-    id = "MIG-BASE64"
-    title = "`base64.encodestring` / `decodestring` (removed in Python 3.9)"
+def _aliases(module: cst.Module) -> dict[str, str]:
+    """Local name -> dotted origin, from every `import a.b as c` / `from a import b as c` in the module."""
+    out: dict[str, str] = {}
+
+    class _V(cst.CSTVisitor):
+        def visit_Import(self, node: cst.Import) -> None:
+            for a in node.names:
+                dotted = _dotted(a.name)
+                if not dotted:
+                    continue
+                if a.asname and isinstance(a.asname.name, cst.Name):
+                    out[a.asname.name.value] = dotted
+                else:
+                    root = dotted.split(".")[0]
+                    out.setdefault(root, root)
+
+        def visit_ImportFrom(self, node: cst.ImportFrom) -> None:
+            if node.relative or isinstance(node.names, cst.ImportStar) or node.module is None:
+                return
+            mod = _dotted(node.module)
+            for a in node.names:
+                if isinstance(a.name, cst.Name):
+                    local = a.asname.name.value if a.asname and isinstance(a.asname.name, cst.Name) else a.name.value
+                    out[local] = f"{mod}.{a.name.value}"
+
+    module.visit(_V())
+    return out
+
+
+def _resolve(dotted: str | None, aliases: dict[str, str]) -> str | None:
+    if not dotted:
+        return None
+    head, _, rest = dotted.partition(".")
+    if head not in aliases:
+        return None
+    return aliases[head] + ("." + rest if rest else "")
+
+
+def _names_used(module: cst.Module) -> set[str]:
+    """Every Name in the module outside import statements (used to drop imports that became unused)."""
+    used: set[str] = set()
+
+    class _V(cst.CSTVisitor):
+        def visit_Import(self, node: cst.Import) -> bool:
+            return False
+
+        def visit_ImportFrom(self, node: cst.ImportFrom) -> bool:
+            return False
+
+        def visit_Name(self, node: cst.Name) -> None:
+            used.add(node.value)
+
+    module.visit(_V())
+    return used
+
+
+def _drop_import(module: cst.Module, dotted: str) -> cst.Module:
+    """Removes a top-level `import <dotted>` line that imports nothing else."""
+    body = [s for s in module.body
+            if not (isinstance(s, cst.SimpleStatementLine) and len(s.body) == 1 and isinstance(s.body[0], cst.Import)
+                    and len(s.body[0].names) == 1 and s.body[0].names[0].asname is None
+                    and _dotted(s.body[0].names[0].name) == dotted)]
+    return module.with_changes(body=body)
+
+
+class _ApiRenames(Migration):
+    """
+    Table-driven, behavior-identical renames: `renames` maps an old dotted API to its new one
+    (`"pipes.quote": "shlex.quote"`), `module_renames` maps an old module to its new name.
+    Handles `mod.attr` (when `mod` is imported at top level; the new module is imported if
+    needed) and `from mod import attr [as x]` (rewritten keeping the local name).
+    """
+
+    renames: ClassVar[dict[str, str]] = {}
+    module_renames: ClassVar[dict[str, str]] = {}
+    drop_unused: ClassVar[tuple[str, ...]] = ()   # removed modules whose import is deleted once unused
+
+    def __init__(self, fix: bool = False) -> None:
+        super().__init__(fix)
+        self._top: set[str] = set()
+        self._add_imports: dict[str, str] = {}   # new module -> module whose import line it follows
+
+    @classmethod
+    def relevant(cls, code: str) -> bool:
+        return any(old.rsplit(".", 1)[-1] in code for old in [*cls.renames, *cls.module_renames])
+
+    def visit_Module(self, node: cst.Module) -> None:
+        self._top = _top_level_imports(node)
+
+    def _bound(self, dotted: str) -> str | None:
+        """The imported module prefix that makes `dotted` reachable, if any."""
+        parts = dotted.split(".")
+        for i in range(len(parts) - 1, 0, -1):
+            prefix = ".".join(parts[:i])
+            if prefix in self._top:
+                return prefix
+        return None
+
+    def leave_Attribute(self, original: cst.Attribute, updated: cst.Attribute) -> cst.BaseExpression:
+        dotted = _dotted(original)
+        if dotted is None:
+            return updated
+        if dotted in self.renames:
+            new = self.renames[dotted]
+            bound = self._bound(dotted)
+            self.hit(original, fixable=bound is not None, detail=f"{dotted} -> {new}")
+            if self.fix and bound is not None:
+                needed = new.rsplit(".", 1)[0] if "." in new else new
+                if needed not in self._top and self._bound(new) is None:
+                    self._add_imports.setdefault(needed, bound)
+                return cst.parse_expression(new)
+        elif dotted in self.module_renames and dotted in self._top:
+            self.hit(original, detail=f"{dotted} -> {self.module_renames[dotted]}")
+            if self.fix:
+                return cst.parse_expression(self.module_renames[dotted])
+        return updated
+
+    def leave_Import(self, original: cst.Import, updated: cst.Import) -> cst.Import:
+        names = list(updated.names)
+        changed = False
+        for i, a in enumerate(original.names):
+            dotted = _dotted(a.name)
+            if dotted in self.module_renames:
+                self.hit(original, detail=f"{dotted} -> {self.module_renames[dotted]}")
+                if self.fix:
+                    names[i] = names[i].with_changes(name=cst.parse_expression(self.module_renames[dotted]))
+                    changed = True
+        return updated.with_changes(names=names) if changed else updated
+
+    def leave_SimpleStatementLine(self, original: cst.SimpleStatementLine,
+                                  updated: cst.SimpleStatementLine) -> Any:
+        stmt = original.body[0] if original.body else None
+        if not isinstance(stmt, cst.ImportFrom) or stmt.relative or stmt.module is None \
+                or isinstance(stmt.names, cst.ImportStar):
+            return updated
+        mod = _dotted(stmt.module)
+        single = len(original.body) == 1
+        if mod in self.module_renames:  # from old_module import x  ->  from new_module import x
+            self.hit(stmt, fixable=single, detail=f"{mod} -> {self.module_renames[mod]}")
+            if self.fix and single:
+                return updated.with_changes(body=[updated.body[0].with_changes(
+                    module=cst.parse_expression(self.module_renames[mod]))])
+            return updated
+        groups: dict[str, list[cst.ImportAlias]] = {}
+        kept: list[cst.ImportAlias] = []
+        for a in stmt.names:
+            name = a.name.value if isinstance(a.name, cst.Name) else None
+            full = f"{mod}.{name}"
+            target = self.renames.get(full) or self.module_renames.get(full)
+            if name is None or target is None:
+                kept.append(a)
+                continue
+            self.hit(stmt, fixable=single, detail=f"{full} -> {target}")
+            new_mod, _, new_name = target.rpartition(".")
+            local = a.asname.name.value if a.asname and isinstance(a.asname.name, cst.Name) else name
+            alias = cst.ImportAlias(name=cst.Name(new_name),
+                                    asname=None if local == new_name else cst.AsName(name=cst.Name(local)))
+            groups.setdefault(new_mod, []).append(alias)
+        if not groups or not (self.fix and single):
+            return updated
+        lines = [cst.SimpleStatementLine(
+            body=[cst.ImportFrom(module=cst.parse_expression(m), names=aliases)],
+            leading_lines=original.leading_lines if i == 0 else ())
+            for i, (m, aliases) in enumerate(groups.items())]
+        if kept:
+            kept = [*kept[:-1], kept[-1].with_changes(comma=cst.MaybeSentinel.DEFAULT)]
+            lines.append(original.with_changes(body=[stmt.with_changes(names=kept)], leading_lines=()))
+        return cst.FlattenSentinel(lines)
+
+    def finish(self, module: cst.Module) -> cst.Module:
+        for needed, after in self._add_imports.items():
+            module = _insert_after_import(module, after, f"import {needed}")
+        used = _names_used(module)
+        for mod in self.drop_unused:
+            if mod in self._top and mod.split(".")[0] not in used:
+                module = _drop_import(module, mod)
+        return module
+
+
+class RenamedStdlibApis(_ApiRenames):
+    id = "MIG-RENAMED-APIS"
+    title = "Standard-library API removed in a recent Python, with an identical replacement"
     severity = "HIGH"
     min_python = "3.9"
-    guideline = "`base64.encodestring` and `decodestring` were renamed `encodebytes` and `decodebytes` with identical behavior."
-    _MAP: ClassVar[dict[str, str]] = {"encodestring": "encodebytes", "decodestring": "decodebytes"}
+    guideline = ("Each of these was an alias (or a moved copy) of the replacement, which takes the same arguments "
+                 "and behaves the same, so the rewrite is mechanical. Removed in: `base64.encodestring` 3.9, "
+                 "`cgi.parse_qs` 3.8, `xml.etree.cElementTree` 3.9, `asyncio.Task.current_task` 3.9, "
+                 "`imp` / `pipes` / `SafeConfigParser` 3.12-3.13, `logging.warn` 3.13.")
+    renames: ClassVar[dict[str, str]] = {
+        "base64.encodestring": "base64.encodebytes",
+        "base64.decodestring": "base64.decodebytes",
+        "logging.warn": "logging.warning",
+        "threading.currentThread": "threading.current_thread",
+        "threading.activeCount": "threading.active_count",
+        "configparser.SafeConfigParser": "configparser.ConfigParser",
+        "cgi.parse_qs": "urllib.parse.parse_qs",
+        "cgi.parse_qsl": "urllib.parse.parse_qsl",
+        "imp.reload": "importlib.reload",
+        "pipes.quote": "shlex.quote",
+        "asyncio.Task.current_task": "asyncio.current_task",
+        "asyncio.Task.all_tasks": "asyncio.all_tasks",
+        "os.errno": "errno",
+    }
+    module_renames: ClassVar[dict[str, str]] = {"xml.etree.cElementTree": "xml.etree.ElementTree"}
+    drop_unused = ("imp", "pipes", "cgi")
+
+
+class CgiEscape(Migration):
+    id = "MIG-CGI-ESCAPE"
+    triggers = ("escape",)
+    title = "`cgi.escape` (removed in Python 3.8)"
+    severity = "HIGH"
+    min_python = "3.8"
+    guideline = ("`cgi.escape(s)` -> `html.escape(s, quote=False)`. `html.escape` quotes `\"` and `'` by default, "
+                 "`cgi.escape` did not, so `quote=False` keeps the output identical.")
 
     def __init__(self, fix: bool = False) -> None:
         super().__init__(fix)
         self._bound = False
+        self._need_html = False
+        self._top: set[str] = set()
 
     def visit_Module(self, node: cst.Module) -> None:
-        self._bound = "base64" in _top_level_imports(node)
+        self._top = _top_level_imports(node)
+        self._bound = "cgi" in self._top
 
-    def leave_Attribute(self, original: cst.Attribute, updated: cst.Attribute) -> cst.BaseExpression:
-        if isinstance(original.value, cst.Name) and original.value.value == "base64" \
-                and original.attr.value in self._MAP:
-            self.hit(original, fixable=self._bound)
-            if self.fix and self._bound:
-                return updated.with_changes(attr=cst.Name(self._MAP[original.attr.value]))
-        return updated
+    def leave_Call(self, original: cst.Call, updated: cst.Call) -> cst.BaseExpression:
+        if _dotted(original.func) != "cgi.escape":
+            return updated
+        # Only the quote=False form is identical: with quote=True, html.escape also escapes `'`.
+        args = list(updated.args)
+        quote_false = len(args) == 2 and not args[1].star and isinstance(args[1].value, cst.Name) \
+            and args[1].value.value == "False" and (args[1].keyword is None or args[1].keyword.value == "quote")
+        ok = self._bound and len(args) in (1, 2) and not args[0].star and args[0].keyword is None \
+            and (len(args) == 1 or quote_false)
+        self.hit(original, fixable=ok, detail="" if ok else "quote=True: html.escape also escapes ', review")
+        if not (self.fix and ok):
+            return updated
+        args = [args[0].with_changes(comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))),
+                cst.Arg(keyword=cst.Name("quote"), value=cst.Name("False"),
+                        equal=cst.AssignEqual(whitespace_before=cst.SimpleWhitespace(""),
+                                              whitespace_after=cst.SimpleWhitespace("")))]
+        self._need_html = "html" not in self._top
+        return updated.with_changes(func=cst.Attribute(value=cst.Name("html"), attr=cst.Name("escape")), args=args)
 
-
-class LoggingWarn(Migration):
-    id = "MIG-LOGGING-WARN"
-    title = "`logging.warn` (deprecated since 3.3, removed in Python 3.13)"
-    severity = "MEDIUM"
-    min_python = "3.13"
-    guideline = "`logging.warn(...)` is an alias of `logging.warning(...)`; the alias is removed in 3.13."
-
-    def __init__(self, fix: bool = False) -> None:
-        super().__init__(fix)
-        self._bound = False
-
-    def visit_Module(self, node: cst.Module) -> None:
-        self._bound = "logging" in _top_level_imports(node)
-
-    def leave_Attribute(self, original: cst.Attribute, updated: cst.Attribute) -> cst.BaseExpression:
-        if isinstance(original.value, cst.Name) and original.value.value == "logging" \
-                and original.attr.value == "warn":
-            self.hit(original, fixable=self._bound)
-            if self.fix and self._bound:
-                return updated.with_changes(attr=cst.Name("warning"))
-        return updated
+    def finish(self, module: cst.Module) -> cst.Module:
+        if self._need_html:
+            module = _insert_after_import(module, "cgi", "import html")
+        if self.fix and self._bound and "cgi" not in _names_used(module):
+            module = _drop_import(module, "cgi")  # cgi itself is removed in 3.13
+        return module
 
 
 class _DetectOnly(Migration):
-    """Detection of dotted-name uses that have no behavior-identical replacement."""
+    """
+    Detection of APIs that have no behavior-identical replacement. `targets` are dotted names,
+    matched through import aliases (`from inspect import getargspec` is found too); `methods`
+    are attribute names matched on any receiver, but only in files importing `requires_import`.
+    """
 
+    fixable: ClassVar[bool] = False
     targets: ClassVar[dict[str, str]] = {}
+    methods: ClassVar[dict[str, str]] = {}
+    requires_import: ClassVar[str] = ""
+
+    def __init__(self, fix: bool = False) -> None:
+        super().__init__(fix)
+        self._aliases: dict[str, str] = {}
+        self._attr_names: set[int] = set()
+        self._active = True
+
+    @classmethod
+    def relevant(cls, code: str) -> bool:
+        if cls.requires_import and cls.requires_import not in code:
+            return False
+        return any(t.rsplit(".", 1)[-1] in code for t in cls.targets) or any(m in code for m in cls.methods)
+
+    def visit_Module(self, node: cst.Module) -> None:
+        self._aliases = _aliases(node)
+        if self.requires_import:
+            self._active = any(v == self.requires_import or v.startswith(self.requires_import + ".")
+                               for v in self._aliases.values())
+
+    def visit_Attribute(self, node: cst.Attribute) -> None:
+        self._attr_names.add(id(node.attr))
 
     def leave_Attribute(self, original: cst.Attribute, updated: cst.BaseExpression) -> cst.BaseExpression:
-        dotted = _dotted(original)
-        if dotted in self.targets:
-            self.hit(original, fixable=False, detail=self.targets[dotted])
+        if not self._active:
+            return updated
+        resolved = _resolve(_dotted(original), self._aliases)
+        if resolved in self.targets:
+            self.hit(original, fixable=False, detail=self.targets[resolved])
+        elif original.attr.value in self.methods and resolved is None:
+            self.hit(original, fixable=False, detail=self.methods[original.attr.value])
+        return updated
+
+    def leave_Name(self, original: cst.Name, updated: cst.Name) -> cst.Name:
+        if self._active and id(original) not in self._attr_names:
+            resolved = self._aliases.get(original.value)
+            if resolved in self.targets and resolved != original.value:
+                self.hit(original, fixable=False, detail=self.targets[resolved])
         return updated
 
 
@@ -307,20 +565,37 @@ class RemovedStdlibApis(_DetectOnly):
     id = "MIG-REMOVED-APIS"
     title = "Standard-library API removed in a recent Python (manual migration)"
     severity = "HIGH"
-    min_python = "3.11"
+    min_python = "3.8"
     guideline = "These APIs no longer exist; the replacement changes arguments or semantics, so migrate by hand."
     targets: ClassVar[dict[str, str]] = {
         "inspect.getargspec": "use inspect.getfullargspec or inspect.signature (removed in 3.11)",
+        "inspect.formatargspec": "use inspect.signature (removed in 3.11)",
         "time.clock": "use time.perf_counter or time.process_time (removed in 3.8)",
         "asyncio.coroutine": "use `async def` (removed in 3.11)",
-        "os.errno": "use the errno module",
         "string.letters": "use string.ascii_letters",
         "sys.maxint": "use sys.maxsize",
-        "array.array.tostring": "use tobytes",
+        "fractions.gcd": "use math.gcd (always non-negative; fractions.gcd took the sign of b; removed in 3.9)",
+        "platform.linux_distribution": "use the `distro` package or platform.freedesktop_os_release (removed in 3.8)",
+        "platform.dist": "use the `distro` package (removed in 3.8)",
         "unittest.makeSuite": "use unittest.TestLoader().loadTestsFromTestCase (removed in 3.13)",
+        "unittest.findTestCases": "use unittest.TestLoader().loadTestsFromModule (removed in 3.13)",
+        "unittest.getTestCaseNames": "use unittest.TestLoader().getTestCaseNames (removed in 3.13)",
         "locale.format": "use locale.format_string (removed in 3.12)",
+        "locale.resetlocale": "use locale.setlocale(locale.LC_ALL, '') (removed in 3.13)",
         "ssl.wrap_socket": "use ssl.SSLContext.wrap_socket (removed in 3.12)",
-        "imp.load_source": "use importlib (module removed in 3.12)",
+        "ssl.match_hostname": "SSLContext does hostname checking (removed in 3.12)",
+        "gettext.lgettext": "use gettext.gettext (removed in 3.11)",
+        "binascii.b2a_hqx": "binhex encoding was removed in 3.11",
+        "imp.load_source": "use importlib.util.spec_from_file_location (imp removed in 3.12)",
+        "imp.find_module": "use importlib.util.find_spec (imp removed in 3.12)",
+        "imp.load_module": "use importlib.import_module (imp removed in 3.12)",
+        "typing.io": "import from typing directly (removed in 3.13)",
+        "typing.re": "import from typing directly (removed in 3.13)",
+        "ast.Num": "use ast.Constant and check type(node.value) (removed in 3.14)",
+        "ast.Str": "use ast.Constant with a str value (removed in 3.14)",
+        "ast.Bytes": "use ast.Constant with a bytes value (removed in 3.14)",
+        "ast.NameConstant": "use ast.Constant (removed in 3.14)",
+        "ast.Ellipsis": "use ast.Constant with value ... (removed in 3.14)",
     }
 
 
@@ -332,10 +607,114 @@ class NaiveUtcNow(_DetectOnly):
     guideline = ("`datetime.utcnow()` returns a naive datetime. `datetime.now(timezone.utc)` is timezone-aware, "
                  "which changes comparison and serialization behavior, so it is not rewritten automatically.")
     targets: ClassVar[dict[str, str]] = {
-        "datetime.utcnow": "use datetime.now(timezone.utc) after checking naive/aware comparisons",
-        "datetime.datetime.utcnow": "use datetime.datetime.now(datetime.timezone.utc)",
-        "datetime.utcfromtimestamp": "use datetime.fromtimestamp(ts, timezone.utc)",
-        "datetime.datetime.utcfromtimestamp": "use datetime.datetime.fromtimestamp(ts, datetime.timezone.utc)",
+        "datetime.datetime.utcnow": "use datetime.now(timezone.utc) after checking naive/aware comparisons",
+        "datetime.datetime.utcfromtimestamp": "use datetime.fromtimestamp(ts, timezone.utc)",
+    }
+
+
+_DEAD_MODULES = {
+    # PEP 594 (removed in 3.13) and earlier removals
+    **dict.fromkeys(("aifc", "audioop", "cgi", "cgitb", "chunk", "crypt", "imghdr", "mailcap", "msilib", "nis", "nntplib", "ossaudiodev", "pipes", "sndhdr", "spwd", "sunau", "telnetlib", "uu", "xdrlib", "lib2to3"), "removed in Python 3.13 (PEP 594)"),
+    "asynchat": "removed in Python 3.12; use asyncio",
+    "asyncore": "removed in Python 3.12; use asyncio",
+    "smtpd": "removed in Python 3.12; use aiosmtpd",
+    "distutils": "removed in Python 3.12; use setuptools / sysconfig / shutil",
+    "imp": "removed in Python 3.12; use importlib",
+    "binhex": "removed in Python 3.11",
+    "formatter": "removed in Python 3.10",
+    "parser": "removed in Python 3.10; use ast",
+    "symbol": "removed in Python 3.10",
+    "macpath": "removed in Python 3.8",
+    "dummy_threading": "removed in Python 3.9; use threading",
+    "_dummy_thread": "removed in Python 3.9",
+    "pkg_resources": "deprecated by setuptools; use importlib.metadata / importlib.resources",
+}
+
+
+class RemovedModules(Migration):
+    id = "MIG-REMOVED-MODULES"
+    triggers = tuple(_DEAD_MODULES)
+    title = "Import of a standard-library module removed from recent Python"
+    severity = "CRITICAL"
+    min_python = "3.10"
+    fixable: ClassVar[bool] = False
+    guideline = ("These modules no longer exist, so the import fails at runtime on new Python versions. Imports "
+                 "inside `try: ... except ImportError` are treated as compatibility shims and not reported.")
+
+    def __init__(self, fix: bool = False) -> None:
+        super().__init__(fix)
+        self._guarded = 0
+
+    @staticmethod
+    def _catches_import_error(node: cst.Try) -> bool:
+        for h in node.handlers:
+            names = [] if h.type is None else (
+                [_dotted(e.value) for e in h.type.elements] if isinstance(h.type, cst.Tuple) else [_dotted(h.type)])
+            if h.type is None or {"ImportError", "ModuleNotFoundError", "Exception"} & set(filter(None, names)):
+                return True
+        return False
+
+    def visit_Try(self, node: cst.Try) -> None:
+        self._guarded += self._catches_import_error(node)
+
+    def leave_Try(self, original: cst.Try, updated: cst.Try) -> cst.Try:
+        self._guarded -= self._catches_import_error(original)
+        return updated
+
+    def _check(self, node: cst.CSTNode, dotted: str | None) -> None:
+        if not dotted or self._guarded:
+            return
+        root = dotted.split(".")[0]
+        if root in _DEAD_MODULES:
+            self.hit(node, fixable=False, detail=f"`{root}` {_DEAD_MODULES[root]}")
+
+    def leave_Import(self, original: cst.Import, updated: cst.Import) -> cst.Import:
+        for a in original.names:
+            self._check(original, _dotted(a.name))
+        return updated
+
+    def leave_ImportFrom(self, original: cst.ImportFrom, updated: cst.ImportFrom) -> cst.ImportFrom:
+        if not original.relative and original.module is not None:
+            self._check(original, _dotted(original.module))
+        return updated
+
+
+class PydanticV1(_DetectOnly):
+    id = "MIG-PYDANTIC-V2"
+    title = "Pydantic v1 API (deprecated since Pydantic 2)"
+    severity = "MEDIUM"
+    pack = "pydantic"
+    requires_import = "pydantic"
+    guideline = ("Pydantic 2 keeps the v1 names as deprecated shims with subtly different validation; migrate with "
+                 "the replacements below and run your tests (see the official migration guide, or `bump-pydantic`).")
+    targets: ClassVar[dict[str, str]] = {
+        "pydantic.validator": "use @field_validator (mode/signature differ)",
+        "pydantic.root_validator": "use @model_validator(mode='before'|'after')",
+        "pydantic.BaseSettings": "moved to the pydantic-settings package",
+        "pydantic.parse_obj_as": "use TypeAdapter(T).validate_python",
+        "pydantic.Extra": "use model_config = ConfigDict(extra=...)",
+    }
+    methods: ClassVar[dict[str, str]] = {
+        "parse_obj": "use Model.model_validate", "parse_raw": "use Model.model_validate_json",
+        "parse_file": "read the file and use model_validate_json", "update_forward_refs": "use model_rebuild",
+        "schema_json": "use json.dumps(Model.model_json_schema())", "__fields__": "use model_fields",
+    }
+
+
+class SqlAlchemy2(_DetectOnly):
+    id = "MIG-SQLALCHEMY-2"
+    title = "SQLAlchemy 1.x API (removed or legacy in SQLAlchemy 2.0)"
+    severity = "MEDIUM"
+    pack = "sqlalchemy"
+    requires_import = "sqlalchemy"
+    guideline = ("SQLAlchemy 2.0 removed implicit autocommit, `engine.execute()` and string SQL without `text()`, "
+                 "and moved `declarative_base` to `sqlalchemy.orm`. Turn on `SQLALCHEMY_WARN_20=1` under 1.4 to "
+                 "find runtime-only cases.")
+    targets: ClassVar[dict[str, str]] = {
+        "sqlalchemy.ext.declarative.declarative_base": "use sqlalchemy.orm.declarative_base or DeclarativeBase",
+        "sqlalchemy.orm.mapper": "use registry.map_imperatively",
+        "sqlalchemy.ext.declarative.declared_attr": "use sqlalchemy.orm.declared_attr",
+        "sqlalchemy.orm.relation": "use sqlalchemy.orm.relationship",
     }
 
 
@@ -347,37 +726,85 @@ def available() -> bool:
     return cst is not None
 
 
-def _select(only: list[str] | None, ignore: list[str] | None) -> list[type[Migration]]:
+def _version(v: str | None) -> tuple[int, ...]:
+    return tuple(int(x) for x in str(v).split(".") if x.isdigit()) if v else ()
+
+
+def _select(only: list[str] | None = None, ignore: list[str] | None = None, packs: list[str] | None = None,
+            target_python: str | None = None) -> list[type[Migration]]:
+    """
+    Migrations to run. `only`/`ignore` are migration ids, `packs` limits to those packs, and
+    `target_python` ("3.12") keeps only stdlib migrations whose API is gone by that version
+    (library packs have no Python version and always apply).
+    """
+    target = _version(target_python)
     return [m for mid, m in REGISTRY.items()
-            if (not only or mid in only) and not (ignore and mid in ignore)]
+            if (not only or mid in only) and not (ignore and mid in ignore)
+            and (not packs or m.pack in packs)
+            and not (target and m.min_python and _version(m.min_python) > target)]
 
 
-def _run(code: str, migration: type[Migration], fix: bool) -> tuple[str, list[Hit]]:
-    module = cst.parse_module(code)
-    wrapper = MetadataWrapper(module, unsafe_skip_copy=True)
+def settings(root: str) -> dict[str, Any]:
+    """
+    Project selection from `.novus/config.toml`:
+
+        [migrations]
+        target_python = "3.12"            # only APIs removed by 3.12
+        ignore = ["MIG-DATETIME-UTCNOW"]
+        packs = ["stdlib", "unittest"]    # default: all
+    """
+    import tomllib
+
+    try:
+        with open(os.path.join(root, ".novus", "config.toml"), "rb") as f:
+            cfg = tomllib.load(f).get("migrations", {})
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, Any] = {}
+    for key in ("only", "ignore", "packs"):
+        if isinstance(cfg.get(key), list):
+            out[key] = [str(x) for x in cfg[key]]
+    if cfg.get("target_python"):
+        out["target_python"] = str(cfg["target_python"])
+    return out
+
+
+def _run(wrapper: MetadataWrapper, migration: type[Migration], fix: bool) -> tuple[str, list[Hit]]:
+    """Runs one migration over an already-parsed module (a wrapper can be visited many times)."""
     t = migration(fix=fix)
     new_module = wrapper.visit(t)
-    new_module = t.finish(new_module) if fix else new_module
-    return new_module.code, t.hits
+    if fix:
+        new_module = t.finish(new_module)
+    return (new_module.code if fix else ""), t.hits
 
 
-def scan(code: str, file_path: str = "", only: list[str] | None = None,
-         ignore: list[str] | None = None) -> list[dict[str, Any]]:
+def _wrap(code: str) -> MetadataWrapper:
+    return MetadataWrapper(cst.parse_module(code), unsafe_skip_copy=True)
+
+
+def scan(code: str, file_path: str = "", **selection: Any) -> list[dict[str, Any]]:
     """Findings (same shape as the rule engine's) for one source; [] if it is not valid Python 3."""
     if cst is None or (file_path and not file_path.lower().endswith((".py", ".pyw"))):
         return []
+    migrations = [m for m in _select(**selection) if m.relevant(code)]
+    if not migrations:
+        return []
     try:
-        cst.parse_module(code)
+        wrapper = _wrap(code)
     except Exception:  # not valid Python 3 (e.g. Python 2 source): nothing to migrate yet
         return []
     lines = code.split("\n")
+    target = _version(selection.get("target_python"))
     findings: list[dict[str, Any]] = []
-    for m in _select(only, ignore):
+    for m in migrations:
         try:
-            _, hits = _run(code, m, fix=False)
+            _, hits = _run(wrapper, m, fix=False)
         except Exception:  # a migration bug must never break an audit
             continue
         for h in hits:
+            removed = re.search(r"removed in (?:Python )?(\d+\.\d+)", h.detail)
+            if target and removed and _version(removed.group(1)) > target:
+                continue  # this API still exists in the target version
             findings.append({
                 "smell_id": m.id, "name": m.title + (f": {h.detail}" if h.detail else ""),
                 "line_number": h.line, "line_content": lines[h.line - 1].strip() if 0 < h.line <= len(lines) else "",
@@ -388,22 +815,26 @@ def scan(code: str, file_path: str = "", only: list[str] | None = None,
     return sorted(findings, key=lambda f: (f["line_number"], f["smell_id"]))
 
 
-def apply(code: str, only: list[str] | None = None, ignore: list[str] | None = None) -> tuple[str, list[str]]:
+def apply(code: str, **selection: Any) -> tuple[str, list[str]]:
     """Applies every safe fix; returns (new_code, notes). Unparseable input is returned unchanged."""
     if cst is None:
         return code, []
     notes: list[str] = []
     current = code
-    for m in _select(only, ignore):
+    wrapper = None
+    for m in _select(**selection):
+        if not m.relevant(current):
+            continue
         try:
-            new, hits = _run(current, m, fix=True)
-            cst.parse_module(new)  # the result must still be valid Python
+            wrapper = wrapper or _wrap(current)
+            new, hits = _run(wrapper, m, fix=True)
+            new_wrapper = _wrap(new) if new != current else wrapper  # the result must still be valid Python
         except Exception:
             continue
         fixed = sum(1 for h in hits if h.fixable)
         manual = len(hits) - fixed
         if fixed and new != current:
-            current = new
+            current, wrapper = new, new_wrapper
             notes.append(f"{m.title}: rewrote {fixed} use(s) ({m.id}).")
         if manual:
             notes.append(f"Manual review: {manual} use(s) of {m.title} ({m.id}) need a manual change.")
@@ -414,5 +845,5 @@ def catalog() -> list[dict[str, Any]]:
     """Every registered migration, for listings."""
     return [{"id": m.id, "title": m.title, "severity": m.severity, "min_python": m.min_python,
              "guideline": m.guideline,
-             "fixable": _DetectOnly not in m.__mro__}
+             "fixable": m.fixable, "pack": m.pack}
             for m in REGISTRY.values()]

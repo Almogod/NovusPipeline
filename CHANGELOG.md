@@ -7,6 +7,17 @@ All notable changes to this project are documented here. The format follows
 ## [Unreleased]
 
 ### Added
+- Modernization campaigns (`novuspipeline campaign`, MCP tool `run_modernization_campaign`):
+  the whole codebase in dependency order, one test-verified commit per file on a branch,
+  resumable from a ledger, with breaking changes told apart from tests that already fail.
+- Migrations: table-driven renames of removed stdlib APIs (`imp.reload`, `pipes.quote`,
+  `SafeConfigParser`, `xml.etree.cElementTree`, `cgi.parse_qs`, `threading` camelCase, ...),
+  `cgi.escape`, removed-module imports (PEP 594, `distutils`, `imp`, ...), more removed APIs
+  (`ast.Num`, `typing.io`, ...), and detect-only Pydantic v1 and SQLAlchemy 1.x packs.
+  Detection resolves import aliases. Selection by `--target-python`, `--pack`, `--migration`,
+  `--skip`, or `[migrations]` in `.novus/config.toml` (also used by the MCP tools).
+- `fix --test-cmd` re-runs failing tests on the original code to say whether the change or
+  the tests are at fault.
 - Command line interface: `novuspipeline scan` (text, JSON or SARIF; `--fail-on`), `fix`
   (`--diff`, `--check`, `--test-cmd` to revert everything when sandboxed tests fail) and
   `migrations`. Plain `novuspipeline` still starts the MCP server.

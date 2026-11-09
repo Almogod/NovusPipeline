@@ -46,16 +46,16 @@ class TestScan(CliCase):
     def test_text_report_and_exit_codes(self):
         code, out, _ = run("scan", "--workspace", self.root, "--no-ruff")
         self.assertEqual(code, 0)
-        self.assertIn("app.py:5: [MEDIUM] MIG-LOGGING-WARN", out)
-        self.assertEqual(run("scan", "--workspace", self.root, "--no-ruff", "--fail-on", "high")[0], 0)
-        self.assertEqual(run("scan", "--workspace", self.root, "--no-ruff", "--fail-on", "medium")[0], 1)
+        self.assertIn("app.py:5: [HIGH] MIG-RENAMED-APIS", out)
+        self.assertEqual(run("scan", "--workspace", self.root, "--no-ruff", "--fail-on", "critical")[0], 0)
+        self.assertEqual(run("scan", "--workspace", self.root, "--no-ruff", "--fail-on", "high")[0], 1)
 
     def test_json_and_sarif(self):
         data = json.loads(run("scan", "--workspace", self.root, "--no-ruff", "--format", "json")[1])
         self.assertEqual(data["files"], 1)
-        self.assertIn("MIG-LOGGING-WARN", {f["smell_id"] for f in data["findings"]})
+        self.assertIn("MIG-RENAMED-APIS", {f["smell_id"] for f in data["findings"]})
         sarif = json.loads(run("scan", "--workspace", self.root, "--no-ruff", "--format", "sarif")[1])
-        result = next(r for r in sarif["runs"][0]["results"] if r["ruleId"] == "MIG-LOGGING-WARN")
+        result = next(r for r in sarif["runs"][0]["results"] if r["ruleId"] == "MIG-RENAMED-APIS")
         self.assertEqual(result["locations"][0]["physicalLocation"]["region"]["startLine"], 5)
         self.assertEqual(sarif["version"], "2.1.0")
 
@@ -66,8 +66,8 @@ class TestScan(CliCase):
         self.assertEqual(cli.discover(self.root, []), ["app.py"])
 
     def test_min_severity_filters(self):
-        _, out, _ = run("scan", "--workspace", self.root, "--no-ruff", "--min-severity", "high")
-        self.assertNotIn("MIG-LOGGING-WARN", out)
+        _, out, _ = run("scan", "--workspace", self.root, "--no-ruff", "--min-severity", "critical")
+        self.assertNotIn("MIG-RENAMED-APIS", out)
 
 
 class TestFix(CliCase):

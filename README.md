@@ -29,6 +29,8 @@ novuspipeline scan --format sarif > out.sarif    # GitHub code scanning (also: -
 novuspipeline fix --diff                         # preview the behavior-preserving rewrites
 novuspipeline fix --test-cmd "python -m pytest"  # apply, run the tests in the sandbox, revert everything if they fail
 novuspipeline fix --check                        # CI: exit 1 if anything is still fixable
+novuspipeline campaign --branch modernize        # whole codebase: one verified commit per file, resumable
+novuspipeline scan --target-python 3.12          # only what breaks on 3.12 (also --pack, --migration, --skip)
 novuspipeline migrations                         # list the library/language migrations
 ```
 
@@ -87,6 +89,15 @@ Per-project settings go in `.novus/config.toml`:
 ```
 
 Entry points declared in `pyproject.toml` are never reported as dead code.
+
+Choose migrations for the CLI and the MCP tools alike:
+
+```toml
+[migrations]
+target_python = "3.12"              # only APIs removed by 3.12 (library packs always apply)
+packs = ["stdlib", "unittest"]      # default: all packs (stdlib, unittest, pydantic, sqlalchemy)
+ignore = ["MIG-DATETIME-UTCNOW"]
+```
 
 ## Your standards (industry, team or personal rules)
 
@@ -161,7 +172,7 @@ You can also do all of this through your assistant:
 | Source | Examples |
 |---|---|
 | Your standards | whatever your rule packs define (see above) |
-| Migrations (libcst) | removed or deprecated stdlib APIs: `unittest` aliases (`assertEquals`, removed in 3.12), `collections.Mapping` etc. (3.10), `base64.encodestring` (3.9), `logging.warn` (3.13); detect-only: `inspect.getargspec`, `datetime.utcnow`, `ssl.wrap_socket`, ... Fixes keep comments and formatting; add your own by subclassing `codemods.Migration` |
+| Migrations (libcst) | **auto-fixed**: `unittest` aliases (`assertEquals`, removed in 3.12), `collections.Mapping` etc. (3.10), renamed APIs (`base64.encodestring`, `logging.warn`, `imp.reload`, `pipes.quote`, `SafeConfigParser`, `xml.etree.cElementTree`, `cgi.parse_qs`, `threading.currentThread`, ...), `cgi.escape` → `html.escape(..., quote=False)`. **Reported**: imports of removed modules (`distutils`, `imp`, `asyncore`, PEP 594 `cgi`/`telnetlib`/..., except inside `try/except ImportError`), removed APIs without an identical replacement (`inspect.getargspec`, `ast.Num`, `ssl.wrap_socket`, ...), naive `datetime.utcnow`, Pydantic v1 and SQLAlchemy 1.x APIs. Aliased imports are resolved; fixes keep comments and formatting. Add your own by subclassing `codemods.Migration` |
 | Built-in legacy rules | Python 2 print and `urllib2`, bare `except`, `os.popen`, unsafe `pickle`, missing type hints (plus ES5 `var`, `any`, `require()` in TypeScript/JavaScript) |
 | Ruff | pyupgrade, bugbear, security (bandit), pathlib, comprehension and simplification rules; safe fixes are applied automatically |
 | Structural GNN (`[gnn]`) | the same smells from AST shape, localized to functions; structurally similar code |
@@ -178,13 +189,15 @@ Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`
 |---|---|
 | Codebase context | `index_codebase`, `get_codebase_overview`, `get_file_context`, `find_similar_code`, `learn_from_history` |
 | Audit | `analyze_legacy_codebase`, `analyze_code_structure_gnn`, `read_legacy_file` |
-| Modernize | `apply_code_modernization`, `generate_llm_modernization_proposal`, `run_autonomous_modernization_pipeline` |
+| Modernize | `apply_code_modernization`, `generate_llm_modernization_proposal`, `run_autonomous_modernization_pipeline`, `run_modernization_campaign` |
 | Verify & ship | `run_local_tests`, `create_git_migration_pr`, `format_modernization_report`, `finalize_git_migration_pr` |
 | Standards | `list_modernization_standards`, `add_modernization_rule`, `remove_modernization_rule`, `install_standard_pack` |
 | Guidelines (RAG) | `query_rag_guidelines`, `search_rag_by_id`, `ingest_rag_document`, `remove_rag_document`, `get_rag_stats`, `reset_rag_database` |
 | Status | `get_gnn_model_status`, `get_local_llm_status` |
 
 `run_autonomous_modernization_pipeline` never touches your working copy. It modernizes the file in a disposable git worktree, runs the tests that import the file in the sandbox, rejects the change if the tests fail or if a symbol other modules import would disappear, and commits only that file to a branch (`branch_name`, default `auto-modernization-branch`; repeated calls add commits to it). It refuses to run on a file with uncommitted changes, or with your checked-out branch as the target. A PR description draft is written to `.novus_index/prs/`.
+
+`run_modernization_campaign` (CLI: `novuspipeline campaign`) does the same for the whole codebase, or the paths you give, in one disposable worktree: files are processed in dependency order (a module before the modules that import it), and each is committed on its own on the campaign branch only if its tests pass. When tests fail, the file is restored and the same tests are re-run on the unchanged code, so a change that breaks tests is told apart from tests that were already failing. Progress is saved after each file (`.novus_index/campaigns/`): stop at any time or use `max_files`, then run again to continue. Every commit can be reviewed, reverted or bisected on its own.
 
 ### Sandbox
 

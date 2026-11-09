@@ -720,7 +720,7 @@ def analyze_legacy_codebase(file_path: str) -> str:
 
         findings = LegacySmellDetector.scan_code(code, file_path)
         if file_path.endswith(".py"):
-            findings += codemods.scan(code, file_path)  # library/language migrations (libcst)
+            findings += codemods.scan(code, file_path, **codemods.settings(WORKSPACE_ROOT))  # libcst migrations
         ruff_findings = ruff_backend.scan_code(code, file_path, *_ruff_settings())
         learned = history_learner.get_learner(WORKSPACE_ROOT).scan(code, file_path) if file_path.endswith(".py") else []
         active = _standards()
@@ -827,7 +827,7 @@ def _modernized_source(path: str, original: str, modernized_code: str = ""
     if modernized_code.strip():
         return modernized_code, ["Applied LLM / user-supplied modernized code."], None
     if path.endswith(".py"):
-        new, notes = CodeModernizer.modernize_python(original)
+        new, notes = CodeModernizer.modernize_python(original, codemods.settings(WORKSPACE_ROOT))
         # Pure renames the team made consistently in its own history; still test-gated by the caller.
         new, learned_notes = history_learner.get_learner(WORKSPACE_ROOT).apply_fixes(new)
         # The organization's standards last, so their fixes win.
@@ -1052,6 +1052,37 @@ def run_autonomous_modernization_pipeline(
         shutil.rmtree(wt_root, ignore_errors=True)
         with contextlib.suppress(git.GitCommandError):
             repo.git.worktree("prune")
+
+
+@_tool("write", timeout=6 * 3600)
+def run_modernization_campaign(
+    branch_name: str = "novus-campaign",
+    paths: str = "",
+    test_command: str = "",
+    max_files: int = 20,
+    retry_failed: bool = False,
+) -> str:
+    """
+    Modernizes many files as a stack of verified commits: every Python file (or those under
+    `paths`) in dependency order, each rewritten like `run_autonomous_modernization_pipeline`,
+    tested with the tests that import it, and committed alone on `branch_name` only if they
+    pass. Failing files are restored and re-tested unchanged to tell a breaking change from
+    tests that already fail. Works in one disposable worktree (your working copy and checked-out
+    branch are untouched) and is resumable: call again to continue after `max_files` files.
+
+    Args:
+        branch_name:  Branch that receives the commits (must not be checked out).
+        paths:        Space-separated files or directories to limit the campaign to (default: all).
+        test_command: Test command for every file; empty selects the related tests per file.
+        max_files:    Changed files to attempt in this call (default 20).
+        retry_failed: Retry files whose tests failed in an earlier run.
+    """
+    from . import campaign
+
+    res = campaign.run(WORKSPACE_ROOT, branch_name, paths.split(), test_command, max_files, retry_failed)
+    if not res["ok"] and not res["results"]:
+        return f"Error: campaign could not run: {res['error']}"
+    return res["summary"] + (f"\n\nPR description draft: `{_rel(res['pr_draft'])}`" if res.get("pr_draft") else "")
 
 
 # ---------------------------------------------------------------------------
@@ -1636,7 +1667,9 @@ def modernization_workflow(file_path: str = "") -> str:
         "related tests, rolls back on failure, API breakage or remaining blocking-standard violations, and "
         "commits only that file.\n"
         "6. Review the follow-up candidates it lists and repeat for them; use `find_similar_code` to find "
-        "other copies of the same pattern."
+        "other copies of the same pattern.\n"
+        "7. To modernize many files at once, call `run_modernization_campaign`: it commits each file separately "
+        "on a branch, only when its tests pass, and can be called again to continue."
     )
 
 
