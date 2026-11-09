@@ -59,12 +59,16 @@ if cst is not None:
         rag_query: ClassVar[str] = "Python Library Modernization"
         pack: ClassVar[str] = "stdlib"            # group for --pack selection (stdlib, pydantic, sqlalchemy, ...)
         fixable: ClassVar[bool] = True            # False: detection only
-        triggers: ClassVar[tuple[str, ...]] = ()  # substrings one of which must occur in the source (speed)
+        trigger: ClassVar[str] = ""               # regex that must match the source for any hit (speed)
 
         @classmethod
         def relevant(cls, code: str) -> bool:
             """Cheap pre-check before parsing: can this migration find anything in `code`?"""
-            return not cls.triggers or any(t in code for t in cls.triggers)
+            if not cls.trigger:
+                return True
+            if "_trigger_re" not in cls.__dict__:
+                cls._trigger_re = re.compile(cls.trigger, re.MULTILINE)
+            return cls._trigger_re.search(code) is not None
 
         def __init_subclass__(cls, **kwargs: Any) -> None:
             super().__init_subclass__(**kwargs)
@@ -131,6 +135,22 @@ def _insert_after_import(module: cst.Module, existing: str, new_stmt: str) -> cs
     return module
 
 
+def _dotted_trigger(dotted_names: list[str], methods: list[str] = ()) -> re.Pattern:
+    """
+    Regex that matches source which may use one of `dotted_names`: `mod.attr` as written, or
+    `attr` imported with `from mod import ... attr` (also parenthesized), or `.method`.
+    """
+    parts = set()
+    for d in dotted_names:
+        mod, _, attr = d.rpartition(".")
+        parts.add(re.escape(".".join(d.split(".")[-2:])) + r"\b")
+        if mod:
+            parts.add(r"^\s*from\s+" + re.escape(mod) + r"\s+import\s*(?:\([^)]*|[^\n]*)\b" + re.escape(attr) + r"\b")
+        parts.add(r"^\s*import\s+[^\n]*\b" + re.escape(d) + r"\b")
+    parts |= {r"\." + re.escape(m) + r"\b" for m in methods}
+    return re.compile("|".join(sorted(parts)), re.MULTILINE)
+
+
 def _import_alias_names(node: cst.ImportFrom) -> list[cst.ImportAlias] | None:
     return None if isinstance(node.names, cst.ImportStar) else list(node.names)
 
@@ -153,7 +173,7 @@ _UNITTEST_ALIASES = {
 class UnittestAliases(Migration):
     id = "MIG-UNITTEST-ALIASES"
     pack = "unittest"
-    triggers = tuple(_UNITTEST_ALIASES)
+    trigger = r"\bself\.(?:" + "|".join(_UNITTEST_ALIASES) + r")\b"
     title = "Deprecated unittest assertion aliases (removed in Python 3.12)"
     severity = "HIGH"
     min_python = "3.12"
@@ -200,7 +220,7 @@ _COLLECTIONS_ABC = {
 
 class CollectionsAbc(Migration):
     id = "MIG-COLLECTIONS-ABC"
-    triggers = ("collections",)
+    trigger = r"^\s*from\s+collections\s+import\b|\bcollections\.(?:" + "|".join(sorted(_COLLECTIONS_ABC)) + r")\b"
     title = "Abstract base classes imported from `collections` (removed in Python 3.10)"
     severity = "HIGH"
     min_python = "3.10"
@@ -341,7 +361,9 @@ class _ApiRenames(Migration):
 
     @classmethod
     def relevant(cls, code: str) -> bool:
-        return any(old.rsplit(".", 1)[-1] in code for old in [*cls.renames, *cls.module_renames])
+        if "_trigger_re" not in cls.__dict__:
+            cls._trigger_re = _dotted_trigger([*cls.renames, *cls.module_renames])
+        return cls._trigger_re.search(code) is not None
 
     def visit_Module(self, node: cst.Module) -> None:
         self._top = _top_level_imports(node)
@@ -466,7 +488,7 @@ class RenamedStdlibApis(_ApiRenames):
 
 class CgiEscape(Migration):
     id = "MIG-CGI-ESCAPE"
-    triggers = ("escape",)
+    trigger = r"\bcgi\.escape\b"
     title = "`cgi.escape` (removed in Python 3.8)"
     severity = "HIGH"
     min_python = "3.8"
@@ -530,9 +552,12 @@ class _DetectOnly(Migration):
 
     @classmethod
     def relevant(cls, code: str) -> bool:
-        if cls.requires_import and cls.requires_import not in code:
+        if cls.requires_import and not re.search(rf"^\s*(?:import|from)\s+{re.escape(cls.requires_import)}\b",
+                                                 code, re.MULTILINE):
             return False
-        return any(t.rsplit(".", 1)[-1] in code for t in cls.targets) or any(m in code for m in cls.methods)
+        if "_trigger_re" not in cls.__dict__:
+            cls._trigger_re = _dotted_trigger(list(cls.targets), list(cls.methods))
+        return cls._trigger_re.search(code) is not None
 
     def visit_Module(self, node: cst.Module) -> None:
         self._aliases = _aliases(node)
@@ -633,7 +658,7 @@ _DEAD_MODULES = {
 
 class RemovedModules(Migration):
     id = "MIG-REMOVED-MODULES"
-    triggers = tuple(_DEAD_MODULES)
+    trigger = r"^\s*(?:import|from)\s+(?:[\w.]+\s*,\s*)*(?:" + "|".join(_DEAD_MODULES) + r")\b"
     title = "Import of a standard-library module removed from recent Python"
     severity = "CRITICAL"
     min_python = "3.10"
