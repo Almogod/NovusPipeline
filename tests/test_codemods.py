@@ -138,6 +138,42 @@ class TestDetection(unittest.TestCase):
         self.assertEqual([f["line_number"] for f in found], [2])
 
 
+class TestCompatibilityShims(unittest.TestCase):
+    """Code that keeps an old API on purpose for old versions is neither reported nor rewritten."""
+
+    def assertUntouched(self, src: str) -> None:
+        self.assertEqual(codemods.scan(src, "a.py"), [])
+        self.assertEqual(rewrite(src), src)
+
+    def test_version_checks(self):
+        self.assertUntouched("import sys\nif sys.version_info >= (3, 3):\n    import importlib\nelse:\n"
+                             "    import imp\n    imp.reload(m)\n")
+
+    def test_hasattr_checks(self):
+        self.assertUntouched("import base64\nif hasattr(base64, 'decodebytes'):\n    f = base64.decodebytes\n"
+                             "else:\n    f = base64.decodestring\n")
+
+    def test_fallback_handlers(self):
+        self.assertUntouched("import asyncio\ntry:\n    t = asyncio.current_task\nexcept AttributeError:\n"
+                             "    t = asyncio.Task.current_task\n")
+        self.assertUntouched("try:\n    from collections.abc import Mapping\nexcept ImportError:\n"
+                             "    from collections import Mapping\n")
+
+    def test_local_stubs_are_not_uses(self):
+        src = "from pydantic import Extra\n\nclass Extra:\n    pass\n\nExtra = None\n"
+        self.assertEqual([f["line_number"] for f in codemods.scan(src, "a.py")], [1])  # the import, not the stubs
+
+    def test_code_outside_the_shim_is_still_migrated(self):
+        src = ("import base64, sys\nif sys.version_info < (3,):\n    x = base64.encodestring(b'')\n"
+               "y = base64.encodestring(b'')\n")
+        self.assertEqual([f["line_number"] for f in codemods.scan(src, "a.py")], [4])
+        self.assertEqual(rewrite(src), src.replace("y = base64.encodestring", "y = base64.encodebytes"))
+
+    def test_no_import_added_for_suppressed_rewrites(self):
+        src = "import imp, sys\nif sys.version_info < (3,):\n    imp.reload(m)\n"
+        self.assertEqual(rewrite(src), src)
+
+
 class TestRobustness(unittest.TestCase):
     def test_unparseable_python_is_left_alone(self):
         src = "print 'hello'\nself.assertEquals(1)\n"

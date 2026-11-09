@@ -84,6 +84,32 @@ if cst is not None:
             pos = self.get_metadata(PositionProvider, node)
             self.hits.append(Hit(pos.start.line, fixable, detail))
 
+        # Compatibility shims keep old APIs on purpose (`if sys.version_info < (3,):`, `if
+        # hasattr(base64, "decodebytes"):`, `except AttributeError:` fallbacks). Hits inside
+        # them are dropped and the subtree is left exactly as written.
+        def _guard_open(self) -> None:
+            self._guards = [*getattr(self, "_guards", []), len(self.hits)]
+
+        def _guard_close(self, original: cst.CSTNode) -> cst.CSTNode:
+            mark = self._guards.pop()
+            del self.hits[mark:]
+            return original
+
+        def visit_If(self, node: cst.If) -> None:
+            if _is_compat_test(node.test):
+                self._guard_open()
+
+        def leave_If(self, original: cst.If, updated: cst.If) -> cst.BaseStatement:
+            return self._guard_close(original) if _is_compat_test(original.test) else updated
+
+        def visit_ExceptHandler(self, node: cst.ExceptHandler) -> None:
+            if _catches(node, _FALLBACK_ERRORS):
+                self._guard_open()
+
+        def leave_ExceptHandler(self, original: cst.ExceptHandler,
+                                updated: cst.ExceptHandler) -> cst.ExceptHandler:
+            return self._guard_close(original) if _catches(original, _FALLBACK_ERRORS) else updated
+
         def finish(self, module: cst.Module) -> cst.Module:
             """Hook for whole-module edits after the visit (e.g. adding an import)."""
             return module
@@ -105,6 +131,24 @@ def _dotted(node: Any) -> str | None:
         base = _dotted(node.value)
         return f"{base}.{node.attr.value}" if base else None
     return None
+
+
+_COMPAT_TEST = re.compile(
+    r"\b(?:version_info|hexversion|PY2|PY3|PY3K|PY\d\d|IS_PY\d\w*|PYTHON\d\w*|hasattr|sys\.modules|"
+    r"VERSION|__version__|\w*_V[12])\b")
+_FALLBACK_ERRORS = {"ImportError", "ModuleNotFoundError", "AttributeError", "NameError"}
+_EMPTY = cst.Module([]) if cst is not None else None
+
+
+def _is_compat_test(test: cst.BaseExpression) -> bool:
+    return _COMPAT_TEST.search(_EMPTY.code_for_node(test)) is not None
+
+
+def _catches(handler: cst.ExceptHandler, names: set[str]) -> bool:
+    if handler.type is None:
+        return False
+    types = [e.value for e in handler.type.elements] if isinstance(handler.type, cst.Tuple) else [handler.type]
+    return any((_dotted(t) or "").split(".")[-1] in names for t in types)
 
 
 def _top_level_imports(module: cst.Module) -> set[str]:
@@ -272,7 +316,7 @@ class CollectionsAbc(Migration):
         return updated
 
     def finish(self, module: cst.Module) -> cst.Module:
-        if self._needs_abc_import:
+        if self._needs_abc_import and "collections.abc." in module.code:
             return _insert_after_import(module, "collections", "import collections.abc")
         return module
 
@@ -449,8 +493,10 @@ class _ApiRenames(Migration):
         return cst.FlattenSentinel(lines)
 
     def finish(self, module: cst.Module) -> cst.Module:
+        code = module.code
         for needed, after in self._add_imports.items():
-            module = _insert_after_import(module, after, f"import {needed}")
+            if re.search(rf"\b{re.escape(needed)}\b", code.replace(f"import {after}", "")):
+                module = _insert_after_import(module, after, f"import {needed}")
         used = _names_used(module)
         for mod in self.drop_unused:
             if mod in self._top and mod.split(".")[0] not in used:
@@ -525,7 +571,7 @@ class CgiEscape(Migration):
         return updated.with_changes(func=cst.Attribute(value=cst.Name("html"), attr=cst.Name("escape")), args=args)
 
     def finish(self, module: cst.Module) -> cst.Module:
-        if self._need_html:
+        if self._need_html and "html.escape(" in module.code:
             module = _insert_after_import(module, "cgi", "import html")
         if self.fix and self._bound and "cgi" not in _names_used(module):
             module = _drop_import(module, "cgi")  # cgi itself is removed in 3.13
@@ -567,6 +613,17 @@ class _DetectOnly(Migration):
 
     def visit_Attribute(self, node: cst.Attribute) -> None:
         self._attr_names.add(id(node.attr))
+
+    # Names the module defines itself (stubs like `class Extra: ...`, `Extra = None`) are not uses.
+    def visit_ClassDef(self, node: cst.ClassDef) -> None:
+        self._attr_names.add(id(node.name))
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> None:
+        self._attr_names.add(id(node.name))
+
+    def visit_AssignTarget(self, node: cst.AssignTarget) -> None:
+        if isinstance(node.target, cst.Name):
+            self._attr_names.add(id(node.target))
 
     def leave_Attribute(self, original: cst.Attribute, updated: cst.BaseExpression) -> cst.BaseExpression:
         if not self._active:
