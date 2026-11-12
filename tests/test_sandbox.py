@@ -31,6 +31,27 @@ class TestSandboxedTestRuns(WorkspaceTestCase):
         self.assertIn("Exit Code: 0", out, out)
         self.assertIn("scrubbed environment", out)
 
+    def test_tests_cannot_read_the_servers_stdin(self):
+        # Under the stdio transport the server's stdin is the MCP channel.
+        out = self.run_test_file("    def test_stdin(self):\n        import sys\n        self.assertEqual(sys.stdin.read(), '')\n")
+        self.assertIn("Exit Code: 0", out, out)
+
+    @unittest.skipUnless(os.name == "nt", "integrity levels are a Windows mechanism")
+    def test_tests_cannot_write_outside_the_sandbox_on_windows(self):
+        victim = self.write("victim.txt", "original")
+        self.write("node_modules/dep/index.js", "real\n")
+        out = self.run_test_file(
+            "    def test_write(self):\n"
+            f"        for path in ({victim!r}, os.path.join('node_modules', 'dep', 'index.js')):\n"
+            "            with self.assertRaises(PermissionError):\n"
+            "                open(path, 'w').write('HACKED')\n"
+            f"        with self.assertRaises(PermissionError):\n            os.remove({victim!r})\n"
+            "        open('scratch.txt', 'w').write('fine inside the sandbox')\n")
+        self.assertIn("Exit Code: 0", out, out)
+        self.assertIn("low integrity level", out)
+        self.assertEqual(self.read("victim.txt"), "original")
+        self.assertEqual(self.read("node_modules/dep/index.js"), "real\n")
+
     @unittest.skipIf(sys.platform == "darwin", "macOS does not enforce RLIMIT_AS")
     def test_memory_limit_is_enforced(self):
         with mock.patch.object(sandbox, "MEMORY_LIMIT_MB", 300):

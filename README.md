@@ -57,6 +57,7 @@ Then ask your agent to use the `modernization_workflow` prompt, or call `get_cod
 | `NOVUS_SANDBOX=docker`, `NOVUS_SANDBOX_IMAGE` | Run tests in a container with no network (the image must contain your test dependencies) |
 | `NOVUS_SANDBOX_MEMORY_MB`, `NOVUS_SANDBOX_MAX_PROCESSES` | Sandbox limits for test runs (default 4096 MB, 256 processes) |
 | `NOVUS_SANDBOX_ENV_ALLOW=A,B` | Environment variables your tests need (all others are hidden from them) |
+| `NOVUS_SANDBOX_LOW_INTEGRITY=0` | Windows: let tests write outside the sandbox (for suites that write into the real `node_modules`) |
 
 Per-project settings go in `.novus/config.toml`:
 
@@ -147,6 +148,11 @@ You can also do all of this through your assistant:
 | Codebase-wide | import cycles (import-time only), dead code, duplicated functions (rename-insensitive), untested hotspots, god modules, uses of APIs listed in `[deprecated]`, unresolvable dynamic imports |
 | Learned from your history | calls and imports your team replaced the same way in several separate commits, with the commits as evidence |
 
+**What gets rewritten automatically.** Rewrites keep behavior: `urllib2` to `urllib.request`, Python 2 `print`, `os.popen(...).read()` to `subprocess.run`, Ruff's safe fixes, your standards' fixes and learned renames. Two cases need more care:
+
+- A bare `except:` becomes `except Exception:`, which no longer swallows `KeyboardInterrupt` and `SystemExit`. That is the point of the fix, but it is a behavior change, so it is skipped where the guarded code awaits, yields, exits or parses arguments (it may rely on catching cancellation or exit) and reported for review instead. A handler that re-raises becomes the exactly equivalent `except BaseException:`.
+- JavaScript/TypeScript is analyzed without a parser. `var` becomes `let` only for a declaration made once, directly in a function body or module, and never used before it or outside that body; everything else, and every `require()`, is reported for review. The codebase index, the GNN and the imported-symbol check cover Python only, and a script file is verified with `npm test` (or the `test_command` you pass), not with the Python tests.
+
 Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`, `__import__`, relative imports with `package=__name__`, `runpy`, spec loaders from file paths, and `getattr(module, "name")`. A dynamic import that can't be resolved is reported (`CTX-DYNAMIC`), and modules under its literal prefix are treated as reachable rather than dead.
 
 **Learned smells.** `learn_from_history` (also run in the background after indexing) compares each changed function before and after every commit. A replacement such as `client.fetch_json(...)` → `client.get_json(...)` becomes a rule when it shows up in at least 3 separate commits, when the team usually chose that replacement for the old call, and when nobody kept writing the old call after the last replacement (this filters out churn of everyday calls). Remaining uses are reported in audits, file context and the overview. Pure renames with consistent history are applied automatically by the pipeline, and like every other change they must pass your tests first. In a time-split check on Inkscape's extensions repository, both auto-fixable rules learned from the history before mid-2019 were later fully applied by its developers, and 4 of the 5 rules with remaining uses were later acted on.
@@ -167,16 +173,19 @@ Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`
 
 ### Sandbox
 
-Test commands must be test runners (`python -m pytest|unittest`, `pytest`, `npm test`, `npm run test[:x]`, `node --test`, `npx jest|vitest|mocha`, `cargo test`, `go test`, `mvn test`, `gradle test`), and they never run in your working tree:
+Test commands must be test runners (`python -m pytest|unittest`, `pytest`, `npm test`, `npm run test[:x]`, `node --test`, `npx jest|vitest|mocha`, `cargo test`, `go test`, `mvn test`, `gradle test`), and they never run in your working tree. Paths in a test command must be relative to the project (no absolute paths, `~` or `..`), and options that start another program (`go test -exec`, `npm --script-shell`, Maven plugin goals) are refused:
 
 | Protection | Windows | Linux | macOS |
 |---|---|---|---|
-| Runs on a temporary copy of the project (or the pipeline's disposable worktree); your files can't be modified | ✓ | ✓ | ✓ |
+| Runs on a temporary copy of the project (or the pipeline's disposable worktree), with no access to the server's stdin | ✓ | ✓ | ✓ |
+| Cannot write outside the sandbox (your files, including the linked `node_modules`, are read-only to the tests) | ✓ low integrity level | with Docker | with Docker |
 | Environment scrubbed (no tokens/API keys); home, app-data and temp point into the sandbox, so `~/.ssh`, `~/.aws` etc. are not found through them | ✓ | ✓ | ✓ |
 | Memory and process-count limits; the whole process tree is killed on timeout | Job Object | rlimits + process group | process group (memory limit not enforced) |
 | No network | with `NOVUS_SANDBOX=docker` | ✓ when user namespaces are available, else Docker | with Docker |
 
-Every test result says which protections were active. Without Docker the sandbox is not a VM: tests still run as your user and can read files outside the project by absolute path. Use `NOVUS_SANDBOX=docker` for code you don't trust.
+Every test result says which protections were active. Without Docker the sandbox is not a VM: tests still run as your user and can read files outside the project by absolute path; on Linux and macOS they can also write to them, and on Windows and macOS they have network access. Use `NOVUS_SANDBOX=docker` for code you don't trust.
+
+The file tools do not read or write anything under `.git`, and the HTTP transport rejects requests whose `Host` or `Origin` header is not local, so a web page in your browser cannot drive the server.
 
 ### Approve once
 

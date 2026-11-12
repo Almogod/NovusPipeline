@@ -11,6 +11,12 @@ tree with the user's environment. Every run gets:
                    are not visible (extend with NOVUS_SANDBOX_ENV_ALLOW=A,B)
   limits           memory and process-count limits, and the whole process tree is
                    killed on timeout (Windows Job Object; POSIX rlimits + process group)
+  no stdin         stdin is the null device: under the stdio transport the server's
+                   own stdin is the MCP channel, which tests must never read from
+  write-up block   Windows: the run gets a low integrity level, so it can write only
+                   inside the sandbox; the user's files, including ones reached by
+                   absolute path or through the node_modules link, are read-only to it
+                   (NOVUS_SANDBOX_LOW_INTEGRITY=0 turns this off)
   network          blocked on Linux when user namespaces allow (`unshare -n`);
                    not isolated on Windows/macOS without a container
   docker           NOVUS_SANDBOX=docker runs inside `docker run --network none`
@@ -147,17 +153,85 @@ def _windows_job(memory_mb: int, max_processes: int):
     return job
 
 
-def _windows_start_in_job(proc: subprocess.Popen, job) -> None:
-    """Assigns a CREATE_SUSPENDED process to the job, then resumes it (no escape window)."""
+def _windows_assign_to_job(proc: subprocess.Popen, job) -> None:
+    """Assigns a CREATE_SUSPENDED process to the job before it runs (no escape window)."""
     import ctypes
     from ctypes import wintypes
 
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    ntdll = ctypes.WinDLL("ntdll")
-    handle = wintypes.HANDLE(int(proc._handle))
-    if not kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), handle):
+    if not kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(int(proc._handle))):
         raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
-    ntdll.NtResumeProcess(handle)
+
+
+def _windows_resume(proc: subprocess.Popen) -> None:
+    import ctypes
+    from ctypes import wintypes
+    ctypes.WinDLL("ntdll").NtResumeProcess(wintypes.HANDLE(int(proc._handle)))
+
+
+# Runs the real command as a child of a process whose token was lowered. The child is
+# created *by* a low-integrity token, so the process object itself is low too; lowering a
+# running process only changes its token, and its own children (multiprocessing) could then
+# not open it.
+_TRAMPOLINE = "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))"
+
+
+def low_integrity_enabled() -> bool:
+    return os.name == "nt" and os.environ.get("NOVUS_SANDBOX_LOW_INTEGRITY", "1") != "0"
+
+
+def allow_sandbox_writes(path: str) -> bool:
+    """
+    Windows: labels `path` low integrity, inherited by everything created inside it
+    afterwards, so a low-integrity test run can write there (and nowhere else). Call it on
+    an empty directory before filling it. Returns False where this does not apply or fails.
+    """
+    if not low_integrity_enabled():
+        return False
+    icacls = os.path.join(os.environ.get("SYSTEMROOT", r"C:\Windows"), "System32", "icacls.exe")
+    try:
+        return subprocess.run([icacls, path, "/setintegritylevel", "(OI)(CI)L"], stdin=subprocess.DEVNULL,
+                              capture_output=True, timeout=30).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _windows_lower_integrity(proc: subprocess.Popen) -> None:
+    """Drops a CREATE_SUSPENDED process to low integrity: no writes to medium-integrity objects (the user's files)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.ConvertStringSidToSidW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_void_p)]
+    advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
+    advapi32.GetLengthSid.restype = wintypes.DWORD
+    advapi32.SetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    TOKEN_QUERY, TOKEN_ADJUST_DEFAULT, TokenIntegrityLevel, SE_GROUP_INTEGRITY = 0x0008, 0x0080, 25, 0x20
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(wintypes.HANDLE(int(proc._handle)), TOKEN_QUERY | TOKEN_ADJUST_DEFAULT,
+                                     ctypes.byref(token)):
+        raise OSError(ctypes.get_last_error(), "OpenProcessToken failed")
+    sid = ctypes.c_void_p()
+    try:
+        if not advapi32.ConvertStringSidToSidW("S-1-16-4096", ctypes.byref(sid)):  # low mandatory level
+            raise OSError(ctypes.get_last_error(), "ConvertStringSidToSid failed")
+        label = SID_AND_ATTRIBUTES(sid, SE_GROUP_INTEGRITY)
+        if not advapi32.SetTokenInformation(token, TokenIntegrityLevel, ctypes.byref(label),
+                                            ctypes.sizeof(label) + advapi32.GetLengthSid(sid)):
+            raise OSError(ctypes.get_last_error(), "SetTokenInformation failed")
+    finally:
+        if sid:
+            kernel32.LocalFree(sid)
+        kernel32.CloseHandle(token)
 
 
 def _windows_close_job(job) -> None:
@@ -210,7 +284,8 @@ def _run_docker(args: list[str], workdir: str, timeout: int, image: str) -> Sand
            "-v", f"{workdir}:/work", "-w", "/work", image, *args]
     start = time.perf_counter()
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+        res = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=timeout)
         out = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         return SandboxResult(res.returncode, out, [f"docker container ({image}), no network, memory/pids limits"],
                              time.perf_counter() - start)
@@ -230,6 +305,9 @@ def run(args: list[str], workspace: str, timeout: int, copy: bool = True) -> San
     try:
         workdir = os.path.join(root, "work") if copy else workspace
         isolation = []
+        # Before anything is created inside: the copy, home and temp inherit the label. A
+        # disposable checkout was labelled by its creator; labelling it again covers new files.
+        low = allow_sandbox_writes(root) and (copy or allow_sandbox_writes(workspace))
         if copy:
             copy_workspace(workspace, workdir)
             isolation.append("project copy (your files cannot be modified)")
@@ -250,17 +328,17 @@ def run(args: list[str], workspace: str, timeout: int, copy: bool = True) -> San
         # tests would import the user's original tree instead of the code being verified.
         env["PYTHONPATH"] = os.pathsep.join(p for p in (workdir, os.path.join(workdir, "src")) if os.path.isdir(p))
         isolation.append(f"scrubbed environment ({len(env)} allowlisted variables; home/temp redirected)")
-        kwargs: dict = {"cwd": workdir, "env": env, "stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True,
-                            "encoding": "utf-8", "errors": "replace"}
+        kwargs: dict = {"cwd": workdir, "env": env, "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                        "stderr": subprocess.STDOUT, "text": True, "encoding": "utf-8", "errors": "replace"}
         job = None
         if os.name == "nt":
+            kwargs["creationflags"] = 0x00000004  # CREATE_SUSPENDED until the job and integrity level are set
             try:
                 job = _windows_job(MEMORY_LIMIT_MB, PROCESS_LIMIT)
-                kwargs["creationflags"] = 0x00000004  # CREATE_SUSPENDED until assigned to the job
-                isolation.append(f"job object: {MEMORY_LIMIT_MB} MB memory, {PROCESS_LIMIT} processes, tree killed on exit")
             except OSError:
                 job = None
-            isolation.append("network: not isolated (needs a container on Windows)")
+            if low:
+                args = [sys.executable, "-I", "-S", "-c", _TRAMPOLINE, *args]
         else:
             kwargs["preexec_fn"] = _posix_preexec(MEMORY_LIMIT_MB, PROCESS_LIMIT)
             isolation.append(f"rlimits: {MEMORY_LIMIT_MB} MB address space, {PROCESS_LIMIT} processes; own process group")
@@ -271,8 +349,24 @@ def run(args: list[str], workspace: str, timeout: int, copy: bool = True) -> San
         start = time.perf_counter()
         proc = subprocess.Popen(args, **kwargs)
         try:
-            if job is not None:
-                _windows_start_in_job(proc, job)
+            if os.name == "nt":
+                try:  # the process is suspended: nothing of it has run yet
+                    if job is not None:
+                        _windows_assign_to_job(proc, job)
+                    if low:
+                        _windows_lower_integrity(proc)
+                except OSError as e:
+                    proc.kill()  # never let it run with less isolation than was set up for
+                    proc.communicate()
+                    raise OSError(f"could not apply the sandbox limits ({e}); NOVUS_SANDBOX_LOW_INTEGRITY=0 runs "
+                                  "tests without the low integrity level") from e
+                if job is not None:
+                    isolation.append(f"job object: {MEMORY_LIMIT_MB} MB memory, {PROCESS_LIMIT} processes, "
+                                     "tree killed on exit")
+                isolation.append("low integrity level (cannot modify files outside the sandbox)" if low
+                                 else "runs with your user's write access")
+                isolation.append("network: not isolated (needs a container on Windows)")
+                _windows_resume(proc)
             try:
                 out, _ = proc.communicate(timeout=timeout)
                 return SandboxResult(proc.returncode, out or "", isolation, time.perf_counter() - start)

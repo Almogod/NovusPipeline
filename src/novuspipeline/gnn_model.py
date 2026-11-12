@@ -219,7 +219,9 @@ def _load_model():
         members = []
         for path in _member_paths():
             model = build_model(config)
-            model.load_state_dict(torch.load(path, map_location="cpu"))
+            # weights_only: a checkpoint is tensors, never pickled code (the default before torch 2.6
+            # would execute a pickle from a NOVUS_GNN_DIR someone else filled).
+            model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
             model.eval()
             members.append(model)
         _MODEL, _MODEL_MTIME, _LOAD_ERROR = members, mtime, None

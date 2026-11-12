@@ -10,6 +10,16 @@ AST instead of regexes.
 `CodeModernizer` applies only transformations that keep runtime behavior
 identical (e.g. urllib2 -> urllib.request, not -> httpx), refuses anything it
 cannot rewrite safely, and verifies that its output still parses.
+
+One rewrite is a deliberate exception: a bare `except:` becomes
+`except Exception:`, which stops swallowing KeyboardInterrupt / SystemExit. It
+is applied only where nothing in the `try` block shows the code relies on
+catching those (no await/yield, no exit calls, no re-raise); a handler that
+re-raises becomes the exactly equivalent `except BaseException:`, and anything
+else is left for manual review.
+
+JavaScript/TypeScript has no parser here, so its rewrites are limited to `var`
+declarations that a conservative scan can show behave the same as `let`.
 """
 
 import ast
@@ -62,6 +72,116 @@ def mask_strings_and_comments(code: str) -> str:
         elif fstring_middle is not None and tok.type == fstring_middle:
             blank(tok.start, tok.end)
     return "".join(chars)
+
+
+# A `/` after one of these starts a regex literal; after anything else it is division.
+# Operators such as `+` are left out on purpose: reading a division as a regex would hide
+# the identifiers after it, and hidden identifiers are what makes a rewrite unsafe.
+_REGEX_PRECEDERS = set("(,=:[!&|?{;")
+_REGEX_KEYWORDS = {"return", "typeof", "instanceof", "in", "of", "new", "delete", "void", "throw", "case", "do",
+                   "else", "yield", "await"}
+
+
+def mask_script_literals(code: str) -> str | None:
+    """
+    JavaScript/TypeScript counterpart of `mask_strings_and_comments`: comments, string and
+    template text and regex bodies become spaces (same length, same lines). `${...}`
+    expressions inside template literals stay visible, because they are code. Returns None
+    when a literal is unterminated, i.e. the scan cannot be trusted.
+    """
+    out = list(code)
+    n = len(code)
+
+    def blank(a: int, b: int) -> None:
+        for k in range(a, min(b, n)):
+            if out[k] not in "\r\n":
+                out[k] = " "
+
+    def template(start: int) -> int | None:
+        """Blanks template text from `start`; returns the index after the closing backtick or `${`."""
+        j = start
+        while j < n:
+            if code[j] == "\\":
+                j += 2
+            elif code[j] == "`":
+                blank(start, j)
+                return j + 1
+            elif code.startswith("${", j):
+                blank(start, j)
+                open_templates.append(braces)
+                return j + 2
+            else:
+                j += 1
+        return None
+
+    open_templates: list[int] = []  # brace depth at each `${` still open
+    braces = 0
+    prev, prev_word = "", ""        # last significant character / identifier, to tell regex from division
+    i = 0
+    while i < n:
+        c = code[i]
+        if c in " \t\r\n":
+            i += 1
+        elif code.startswith("//", i):
+            j = code.find("\n", i)
+            j = n if j < 0 else j
+            blank(i, j)
+            i = j
+        elif code.startswith("/*", i):
+            j = code.find("*/", i + 2)
+            if j < 0:
+                return None
+            blank(i, j + 2)
+            i = j + 2
+        elif c in "\"'":
+            j = i + 1
+            while j < n and code[j] != c:
+                if code[j] == "\n":
+                    return None
+                j += 2 if code[j] == "\\" else 1
+            if j >= n:
+                return None
+            blank(i + 1, j)
+            i, prev, prev_word = j + 1, c, ""
+        elif c == "`":
+            j = template(i + 1)
+            if j is None:
+                return None
+            i, prev, prev_word = j, "`", ""
+        elif c == "/" and (not prev or prev in _REGEX_PRECEDERS or prev_word in _REGEX_KEYWORDS):
+            j, in_class = i + 1, False
+            while j < n and code[j] != "\n" and (in_class or code[j] != "/"):
+                if code[j] == "\\":
+                    j += 1
+                elif code[j] == "[":
+                    in_class = True
+                elif code[j] == "]":
+                    in_class = False
+                j += 1
+            if j < n and code[j] == "/":
+                blank(i + 1, j)
+                i, prev, prev_word = j + 1, "/", ""
+            else:  # no closing slash on this line: an operator after all
+                i, prev, prev_word = i + 1, "/", ""
+        elif c.isalnum() or c in "_$":
+            j = i
+            while j < n and (code[j].isalnum() or code[j] in "_$"):
+                j += 1
+            i, prev, prev_word = j, "a", code[i:j]
+        else:
+            if c == "{":
+                braces += 1
+            elif c == "}":
+                if open_templates and open_templates[-1] == braces:
+                    open_templates.pop()
+                    j = template(i + 1)
+                    if j is None:
+                        return None
+                    i, prev, prev_word = j, "`", ""
+                    continue
+                braces -= 1
+            i, prev, prev_word = i + 1, c, ""
+    return None if open_templates else "".join(out)
 
 
 def _sub_outside_literals(pattern: str, repl, code: str, flags: int = re.MULTILINE) -> tuple[str, int]:
@@ -244,7 +364,8 @@ class LegacySmellDetector:
 
         is_python = "python" in categories and not lower.endswith(SCRIPT_EXTENSIONS)
         tree = _parse(code) if is_python else None
-        masked = mask_strings_and_comments(code) if is_python else code
+        # Scripts: text inside strings and comments is not code either ("var" in a sentence).
+        masked = mask_strings_and_comments(code) if is_python else (mask_script_literals(code) or code)
         original_lines = code.split("\n")
 
         found: dict[tuple[str, int], dict[str, Any]] = {}
@@ -275,6 +396,31 @@ class LegacySmellDetector:
 # ---------------------------------------------------------------------------
 
 _URLLIB2_ERRORS = {"HTTPError", "URLError", "ContentTooShortError"}
+# Names whose presence in a `try` block means a bare `except:` may be there to catch something
+# `except Exception:` would let through (argparse's parse_args exits with SystemExit).
+_NON_EXCEPTION_SIGNS = {"SystemExit", "KeyboardInterrupt", "GeneratorExit", "BaseException", "BaseExceptionGroup",
+                        "CancelledError", "exit", "quit", "parse_args", "parse_known_args", "parse_intermixed_args"}
+_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+
+
+def _walk_same_scope(body: list[ast.stmt]):
+    """Nodes that run as part of `body` itself (nested function and class bodies are skipped)."""
+    stack: list[ast.AST] = list(body)
+    while stack:
+        node = stack.pop()
+        yield node
+        if not isinstance(node, _SCOPES):
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _relies_on_base_exceptions(body: list[ast.stmt]) -> bool:
+    for node in _walk_same_scope(body):
+        if isinstance(node, (ast.Await, ast.AsyncFor, ast.AsyncWith, ast.Yield, ast.YieldFrom)):
+            return True  # cancellation and generator close arrive as BaseException subclasses
+        name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+        if name in _NON_EXCEPTION_SIGNS:
+            return True
+    return False
 
 
 def _ensure_import(code: str, statement: str) -> str:
@@ -383,6 +529,56 @@ class CodeModernizer:
         return "\n".join(lines)
 
     @classmethod
+    def _narrow_bare_excepts(cls, code: str, changes: list[str]) -> str:
+        """
+        `except:` -> `except Exception:` where the `try` block gives no sign of relying on
+        catching KeyboardInterrupt / SystemExit / GeneratorExit / CancelledError, and
+        -> `except BaseException:` (identical behavior) where the handler re-raises.
+        """
+        bare_line = re.compile(r"^([ \t]*)except[ \t]*:")
+        tree = _parse(code)
+        if tree is None:
+            # Not valid Python 3 (yet): no AST to judge each handler by, so judge the whole file.
+            masked = mask_strings_and_comments(code)
+            if not re.search(bare_line.pattern, masked, re.MULTILINE):
+                return code
+            names = "|".join(sorted(_NON_EXCEPTION_SIGNS | {"await", "yield"}))
+            if re.search(rf"\b(?:{names})\b|^[ \t]*raise[ \t]*$", masked, re.MULTILINE):
+                changes.append("Manual review: bare `except:` left as-is; the file exits, re-raises or awaits, "
+                               "so narrowing it could change behavior.")
+                return code
+            code, n = _sub_outside_literals(bare_line.pattern, r"\1except Exception:", code)
+            changes.append(f"Replaced {n} bare `except:` with `except Exception:` "
+                           "(KeyboardInterrupt / SystemExit are no longer swallowed).")
+            return code
+
+        lines = code.split("\n")
+        narrowed = reraising = skipped = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for handler in node.handlers:
+                if handler.type is not None or not bare_line.match(lines[handler.lineno - 1]):
+                    continue
+                if any(isinstance(n, ast.Raise) and n.exc is None for n in _walk_same_scope(handler.body)):
+                    replacement, reraising = "BaseException", reraising + 1
+                elif _relies_on_base_exceptions(node.body) or _relies_on_base_exceptions(handler.body):
+                    skipped += 1
+                    continue
+                else:
+                    replacement, narrowed = "Exception", narrowed + 1
+                lines[handler.lineno - 1] = bare_line.sub(rf"\1except {replacement}:", lines[handler.lineno - 1], count=1)
+        if narrowed:
+            changes.append(f"Replaced {narrowed} bare `except:` with `except Exception:` "
+                           "(KeyboardInterrupt / SystemExit are no longer swallowed).")
+        if reraising:
+            changes.append(f"Replaced {reraising} re-raising bare `except:` with the equivalent `except BaseException:`.")
+        if skipped:
+            changes.append(f"Manual review: {skipped} bare `except:` left as-is; the guarded code awaits, yields or "
+                           "exits, so it may rely on catching cancellation or exit.")
+        return "\n".join(lines)
+
+    @classmethod
     def modernize_python(cls, code: str) -> tuple[str, list[str]]:
         """Modernizes legacy Python code while preserving runtime behavior."""
         changes: list[str] = []
@@ -409,10 +605,7 @@ class CodeModernizer:
         if re.search(r"\bos\.popen\(", mask_strings_and_comments(updated)):
             changes.append("Manual review: `os.popen` used without `.read()`; rewrite to subprocess by hand.")
 
-        updated, n = _sub_outside_literals(r"^([ \t]*)except[ \t]*:", r"\1except Exception:", updated)
-        if n:
-            changes.append(f"Replaced {n} bare `except:` with `except Exception:` "
-                           "(KeyboardInterrupt / SystemExit now propagate, as intended).")
+        updated = cls._narrow_bare_excepts(updated, changes)
 
         if re.search(r"\bc?[Pp]ickle\.loads?\(", mask_strings_and_comments(updated)):
             changes.append("Manual review: pickle deserialization has no behavior-preserving automatic "
@@ -429,21 +622,130 @@ class CodeModernizer:
         return updated, changes
 
     @classmethod
-    def modernize_typescript(cls, code: str) -> tuple[str, list[str]]:
-        """Modernizes legacy JavaScript/TypeScript code."""
+    def modernize_typescript(cls, code: str, file_path: str = "") -> tuple[str, list[str]]:
+        """
+        Modernizes legacy JavaScript/TypeScript code. Without a parser, only `var`
+        declarations that `_let_equivalent_vars` can show behave the same as `let` are
+        rewritten; `require()` is reported, never rewritten (an `import` is hoisted, needs
+        an ES module, and binds a default export differently).
+        """
         changes: list[str] = []
-        updated = code
+        masked = mask_script_literals(code)
+        if masked is None:
+            return code, ["Manual review: the file has an unterminated string, template or comment; nothing was rewritten."]
 
-        # `let`, not `const`: a `var` may be reassigned later.
-        if re.search(r"\bvar\s+", updated):
-            updated = re.sub(r"\bvar\s+", "let ", updated)
-            changes.append("Replaced ES5 `var` with block-scoped `let`.")
+        total = len(re.findall(r"\bvar\b", masked))
+        if total:
+            reason = ""
+            if file_path.lower().endswith((".jsx", ".tsx")):
+                reason = "JSX text cannot be told apart from code without a parser"
+            elif re.search(r"\b(?:eval|with)\s*\(", masked):
+                reason = "the file uses `eval` or `with`, which can reach any variable"
+            positions = [] if reason else _let_equivalent_vars(masked, file_path)
+            updated = code
+            for p in sorted(positions, reverse=True):
+                updated = updated[:p] + "let" + updated[p + 3:]  # `let`, not `const`: it may be reassigned
+            code = updated
+            if positions:
+                changes.append(f"Replaced {len(positions)} ES5 `var` declaration(s) with block-scoped `let` "
+                               "(each declared once in a function body or module, and never used before its "
+                               "declaration or outside that body).")
+            if total > len(positions):
+                changes.append(f"Manual review: {total - len(positions)} `var` declaration(s) left as-is: "
+                               + (reason or "`let` cannot be shown to behave the same (hoisting, redeclaration, a "
+                                            "loop or other block, or a script-level global)") + ".")
 
-        for var_name, _quote, mod_path in re.findall(r"const\s+(\w+)\s*=\s*require\((['\"])(.*?)\2\);?", updated):
-            for old in (f"const {var_name} = require('{mod_path}');", f'const {var_name} = require("{mod_path}");'):
-                if old in updated:
-                    updated = updated.replace(old, f"import {var_name} from '{mod_path}';")
-                    changes.append(f"Converted `const {var_name} = require('{mod_path}')` -> ES module import.")
+        requires = len(re.findall(r"\b(?:const|let|var)\s+[\w$]+\s*=\s*require\(", masked))
+        if requires:
+            changes.append(f"Manual review: {requires} CommonJS `require()` import(s); converting to `import` changes "
+                           "module semantics, so migrate the module as a whole.")
+        return code, changes
+
+
+def _let_equivalent_vars(masked: str, file_path: str = "") -> list[int]:
+    """
+    Offsets of `var` keywords (in JS/TS source masked by `mask_script_literals`) that can
+    become `let` without changing behavior. A declaration qualifies only if all hold:
+      - it is a statement of its own declaring one plain name, ending in `;`
+      - the name is declared nowhere else, and its first mention in the file is the
+        declaration (so no hoisted use, no parameter or import of the same name)
+      - the name is not used in its own initializer (`var a = a || {}`)
+      - it sits directly in a function body, or at the top level of a module: not in an
+        `if`/loop/`try` block (a `let` there is scoped to the block and, in a loop, is a
+        new binding per iteration) and not at the top level of a classic script, where
+        `var` creates a global
+      - every mention is inside that function body
+      - no named function could read it early: a `function f() {}` declaration is hoisted
+        and may run before the `var` line, where `let` throws instead of giving undefined
+    """
+    pairs: list[tuple[int, int]] = []
+    stack: list[int] = []
+    for m in re.finditer(r"[{}]", masked):
+        if m.group() == "{":
+            stack.append(m.start())
+        elif not stack:
+            return []
+        else:
+            pairs.append((stack.pop(), m.start()))
+    if stack:
+        return []
+
+    def is_function_body(open_brace: int) -> bool:
+        head = masked[:open_brace].rstrip()
+        if head.endswith("=>"):
+            return True
+        if not head.endswith(")"):
+            return False  # `else {`, `try {`, `do {`, a typed TS signature, ...: not provably a function
+        depth = 0
+        for k in range(len(head) - 1, -1, -1):
+            depth += (head[k] == ")") - (head[k] == "(")
+            if depth == 0:
+                return re.search(r"\b(?:if|for|while|switch|catch|with|await)\s*$", head[:k]) is None
+        return False
+
+    def innermost(position: int) -> tuple[int, int]:
+        inside = [(a, b) for a, b in pairs if a < position < b]
+        return max(inside, key=lambda p: p[0]) if inside else (-1, len(masked))
+
+    named_functions = [m.start() for m in re.finditer(r"\bfunction\b\s*\*?\s*[\w$]+\s*\(", masked)]
+
+    is_module = file_path.lower().endswith((".mjs", ".cjs", ".mts", ".cts")) or re.search(
+        r"^\s*(?:import|export)\b|\brequire\s*\(|\bmodule\.exports\b|\bexports\.", masked, re.MULTILINE) is not None
+
+    safe: list[int] = []
+    for m in re.finditer(r"^[ \t]*var[ \t]+([A-Za-z_$][\w$]*)", masked, re.MULTILINE):
+        name, start, name_end = m.group(1), m.start() + m.group().index("var"), m.end()
+        before = masked[:start].rstrip()
+        if before and before[-1] not in ";{}":
+            continue  # `for (var ...`, `export var`, a braceless `if`/`else`, a `case` label, ...
+        # The statement must end with `;`, with no second declarator and no line break at depth 0.
+        depth, end = 0, None
+        for k in range(name_end, len(masked)):
+            ch = masked[k]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+                if depth < 0:
                     break
-
-        return updated, changes
+            elif depth == 0 and ch in ",\n":
+                break
+            elif depth == 0 and ch == ";":
+                end = k
+                break
+        if end is None:
+            continue
+        mentions = [x.start() for x in re.finditer(rf"(?<![\w$]){re.escape(name)}(?![\w$])", masked)]
+        declared = len(re.findall(rf"\b(?:var|let|const|function|class)\s+{re.escape(name)}(?![\w$])", masked))
+        if declared != 1 or mentions[0] != name_end - len(name) or any(name_end <= x <= end for x in mentions):
+            continue
+        lo, hi = innermost(start)
+        if not (is_function_body(lo) if lo >= 0 else is_module):
+            continue
+        if any(not lo < x < hi for x in mentions):
+            continue
+        nested = any(innermost(x) != (lo, hi) for x in mentions)
+        if nested and any(lo < f < hi for f in named_functions):
+            continue
+        safe.append(start)
+    return safe

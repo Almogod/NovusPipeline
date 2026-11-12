@@ -6,6 +6,36 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- Test commands may no longer contain absolute paths, `~` or `..`: they pointed
+  out of the sandbox copy at real files (`pytest --basetemp=<dir>` empties that
+  directory). Options that start another program are refused (`go test -exec`,
+  `-toolexec`, `npm --script-shell`, `cargo --config`, `node -e`, Maven
+  `plugin:goal` invocations).
+- Sandboxed tests no longer inherit the server's stdin, which is the MCP channel
+  under the stdio transport.
+- Windows: sandboxed tests run with a low integrity level and cannot write
+  outside the sandbox, including through the linked `node_modules`
+  (`NOVUS_SANDBOX_LOW_INTEGRITY=0` to disable).
+- pytest is detected without importing it from the project directory, which ran
+  a `pytest.py` in the workspace outside the sandbox.
+- The file tools refuse paths under `.git`.
+- The HTTP transport validates `Host` and `Origin` headers on loopback addresses
+  (DNS rebinding).
+- GNN checkpoints load with `weights_only=True`; the LLM worker log moved from
+  the shared temp directory to the user data directory.
+
+### Changed
+- A bare `except:` is narrowed to `except Exception:` only where the `try` block
+  does not await, yield, exit or parse arguments; a re-raising handler becomes
+  `except BaseException:`; other cases are reported for manual review.
+- JavaScript/TypeScript: strings, comments, templates and regex literals are
+  masked before detection. `var` becomes `let` only where that is provably
+  equivalent, and `require()` is no longer rewritten to `import`.
+- The pipeline verifies a JavaScript/TypeScript file with `npm test` (or
+  `test_command`) and stops when there is neither, instead of running the
+  Python tests.
+
 ## [0.1.0]
 
 First public release.

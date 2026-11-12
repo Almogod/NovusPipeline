@@ -27,7 +27,6 @@ import queue
 import re
 import subprocess
 import sys
-import tempfile
 import threading
 from collections import Counter
 from collections.abc import Callable
@@ -45,8 +44,19 @@ def adapter_path() -> str:
 def model_name() -> str:
     path = adapter_path()
     return os.path.basename(path.rstrip("\\/")) if path else os.environ.get("NOVUS_LLM_BASE_MODEL", DEFAULT_BASE_MODEL)
-# Worker stderr (load progress, tracebacks) — kept for diagnosing load/OOM failures.
-WORKER_LOG = os.path.join(tempfile.gettempdir(), "novus_llm_worker.log")
+
+
+def worker_log() -> str:
+    """
+    Worker stderr (load progress, tracebacks), kept for diagnosing load/OOM failures. It
+    lives in the user's own data directory: a fixed file name in the shared temp directory
+    could be pre-created, or symlinked to another file, by a different local user.
+    """
+    from .ingest_rag import data_dir
+    return os.path.join(data_dir(), "llm_worker.log")
+
+
+
 LOAD_TIMEOUT_SECONDS = 600
 GENERATE_TIMEOUT_SECONDS = 900
 
@@ -87,7 +97,8 @@ class LLMWorker:
         if python is None:
             raise RuntimeError('No LLM interpreter: pip install "novuspipeline[llm]" or set NOVUS_LLM_PYTHON.')
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
-        with open(WORKER_LOG, "a", encoding="utf-8") as log:
+        os.makedirs(os.path.dirname(worker_log()), exist_ok=True)
+        with open(worker_log(), "a", encoding="utf-8") as log:
             self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                           stderr=log, text=True, encoding="utf-8", env=env)
         self._lines = queue.Queue()
@@ -145,7 +156,7 @@ def get_model_info(probe: bool = False) -> dict[str, Any]:
         "base_model": os.environ.get("NOVUS_LLM_BASE_MODEL", DEFAULT_BASE_MODEL),
         "worker_python": llm_python(),
         "worker_running": _WORKER.running,
-        "worker_log": WORKER_LOG,
+        "worker_log": worker_log(),
     }
     if info["adapter_found"]:
         try:

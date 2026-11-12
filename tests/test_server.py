@@ -279,9 +279,49 @@ class TestCodeModernizer(unittest.TestCase):
         code = "print -1\n"  # legal (if odd) Python 3; rewriting would change meaning
         self.assertEqual(CodeModernizer.modernize_python(code)[0], code)
 
-    def test_modernize_typescript_uses_let(self):
-        out, _ = CodeModernizer.modernize_typescript("var x = 1;\nx = 2;\n")
-        self.assertEqual(out, "let x = 1;\nx = 2;\n")
+    def test_bare_except_is_narrowed_only_where_nothing_relies_on_it(self):
+        def handler(code: str) -> str:
+            out, _ = CodeModernizer.modernize_python(code)
+            return next(line.strip() for line in out.split("\n") if line.strip().startswith("except"))
+
+        self.assertEqual(handler("try:\n    f()\nexcept:\n    pass\n"), "except Exception:")
+        # Re-raising cleanup must still run on Ctrl-C: BaseException is the identical spelling.
+        self.assertEqual(handler("try:\n    f()\nexcept:\n    undo()\n    raise\n"), "except BaseException:")
+        for body in ("async def g():\n    try:\n        await task\n    except:\n        pass\n",  # CancelledError
+                     "def g():\n    try:\n        yield 1\n    except:\n        pass\n",             # GeneratorExit
+                     "try:\n    args = parser.parse_args()\nexcept:\n    usage()\n",                 # SystemExit
+                     "try:\n    sys.exit(main())\nexcept:\n    pass\n"):
+            out, notes = CodeModernizer.modernize_python(body)
+            self.assertEqual(out, body, body)
+            self.assertTrue(any(n.startswith("Manual review") for n in notes), notes)
+
+    def test_modernize_typescript_converts_only_provably_equivalent_var(self):
+        def lets(code: str, path: str = "a.js") -> int:
+            return CodeModernizer.modernize_typescript(code, path)[0].count("let ")
+
+        self.assertEqual(CodeModernizer.modernize_typescript("function f() {\n  var x = 1;\n  return x;\n}\n")[0],
+                         "function f() {\n  let x = 1;\n  return x;\n}\n")
+        self.assertEqual(lets("import a from 'a';\nvar x = a;\nexport { x };\n"), 1)  # module scope
+        for unsafe in (
+            "var x = 1;\nx = 2;\n",                                                     # classic script: a global
+            "function f() {\n  g();\n  var x = 1;\n  function g() { return x; }\n}\n",  # hoisted reader: TDZ error
+            "function f() {\n  log(`${x}`);\n  var x = 1;\n}\n",                        # used before declaration
+            "function f(c) {\n  if (c) {\n    var x = 1;\n  }\n  return x;\n}\n",       # used outside its block
+            "function f() {\n  for (;;) {\n    var x = 1;\n    fns.push(() => x);\n  }\n}\n",  # per-iteration binding
+            "function f() {\n  var a = a || {};\n}\n",                                  # reads itself
+            "function f(x) {\n  var x = 1;\n}\n",                                       # redeclares a parameter
+            "function f() {\n  var a = 1, b = 2;\n}\n",
+        ):
+            out, notes = CodeModernizer.modernize_typescript(unsafe, "a.js")
+            self.assertEqual(out, unsafe, unsafe)
+            self.assertTrue(any(n.startswith("Manual review") for n in notes), notes)
+
+    def test_modernize_typescript_ignores_strings_and_never_rewrites_require(self):
+        code = "const fs = require('fs');\nfunction f() {\n  // var y = 1;\n  return 'var z = 2;';\n}\n"
+        out, notes = CodeModernizer.modernize_typescript(code, "a.js")
+        self.assertEqual(out, code)
+        self.assertTrue(any("require()" in n for n in notes), notes)
+        self.assertEqual(smell_ids("// var x\nconst s = 'var y = 1';\n", "a.js"), [])
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +347,22 @@ class TestRunLocalTests(unittest.TestCase):
         for args in (["python", "-m", "pytest", "-q"], ["python", "-m", "unittest", "discover"], ["npm", "test"],
                      ["npm", "run", "test:unit"], ["cargo", "test"], ["go", "test", "./..."], ["node", "--test"]):
             self.assertIsNone(server._validate_test_command(args), args)
+
+    def test_paths_outside_the_project_copy_are_rejected(self):
+        # `--basetemp` empties the directory it is given; absolute paths reach the user's real files.
+        for cmd in ("pytest --basetemp=C:/Users/me/Documents", "pytest --basetemp=/home/me", "pytest --junitxml ~/x.xml",
+                    "python -m pytest ../other", "pytest --rootdir=..", "python -m unittest discover -s /etc",
+                    "C:/tools/pytest.exe -q", "npm test --prefix ../elsewhere"):
+            self.assertIn("paths must be relative to the project root", run_local_tests(cmd), cmd)
+        for args in (["pytest", "tests/test_a.py::TestA::test_b", "-k", "a or b"], ["go", "test", "./..."],
+                     ["python", "-m", "pytest", "--basetemp=build/tmp", "-p", "no:cacheprovider"]):
+            self.assertIsNone(server._validate_test_command(args), args)
+
+    def test_options_that_run_other_programs_are_rejected(self):
+        for cmd in ("go test -exec calc ./...", "go test -toolexec=calc", "npm test --script-shell=calc",
+                    "cargo test --config build.rustc-wrapper='calc'", "node --test -e 1"):
+            self.assertIn("is not allowed in a test command", run_local_tests(cmd), cmd)
+        self.assertIn("not plugin goals", run_local_tests("mvn test org.codehaus.mojo:exec-maven-plugin:3.1.0:exec"))
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +460,30 @@ class TestModernizationTools(WorkspaceTestCase):
         res = apply_code_modernization("lib.py", modernized_code="def renamed() -> int:\n    return 1\n")
         self.assertIn("WARNING", res)
         self.assertIn("`helper`", res)
+
+    def test_git_metadata_is_neither_read_nor_written(self):
+        # A hook or `.git/config` written by a tool would run outside the sandbox on the next git command.
+        hook = self.write(".git/hooks/pre-commit", "#!/bin/sh\n")
+        for res in (read_legacy_file(".git/config"), apply_code_modernization(".git/hooks/pre-commit", "#!/bin/sh\ncurl evil\n"),
+                    run_autonomous_modernization_pipeline(".git/hooks/pre-commit")):
+            self.assertIn("is git metadata", res)
+        with open(hook, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "#!/bin/sh\n")
+
+    def test_pytest_detection_does_not_run_workspace_code(self):
+        # A `pytest.py` in the project root must not be imported outside the sandbox.
+        self.write("pytest.py", "open('PWNED', 'w').write('x')\n")
+        with mock.patch.dict(server._PYTEST_AVAILABLE, clear=True):
+            server._default_test_command(None)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "PWNED")))
+
+    def test_script_files_are_not_verified_by_the_python_suite(self):
+        self.write("app.js", "function f() {\n  var x = 1;\n  return x;\n}\n")
+        self.commit_all()
+        self.assertEqual(server._default_test_command(None, "app.js"), "")
+        self.assertIn("no tests to verify", run_autonomous_modernization_pipeline("app.js", branch_name="js"))
+        self.write("package.json", '{"scripts": {"test": "node --test"}}')
+        self.assertEqual(server._default_test_command(None, "app.js"), "npm test")
 
     def test_generate_llm_modernization_proposal_includes_context(self):
         self.write("lib.py", LEGACY_MODULE)

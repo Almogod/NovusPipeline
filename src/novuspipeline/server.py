@@ -103,6 +103,19 @@ def is_path_in_workspace(target_path: str) -> bool:
         return False
 
 
+def _is_git_metadata(full_path: str) -> bool:
+    """
+    True for anything under a `.git` directory. Hooks and `config` there are executed by
+    git (so writing them is code execution outside the sandbox), and `config` can hold
+    credentials, so the file tools neither read nor write them.
+    """
+    try:
+        rel = os.path.relpath(os.path.realpath(full_path), os.path.realpath(WORKSPACE_ROOT))
+    except ValueError:  # different drives on Windows
+        return False
+    return ".git" in os.path.normcase(rel).replace("\\", "/").split("/")
+
+
 def _resolve_workspace_path(file_path: str) -> str:
     """Absolute path for a workspace-relative or absolute `file_path` (not yet validated)."""
     return os.path.abspath(file_path if os.path.isabs(file_path) else os.path.join(WORKSPACE_ROOT, file_path))
@@ -139,6 +152,8 @@ def read_legacy_file(file_path: str) -> str:
 
         if not is_path_in_workspace(full_path):
             return f"Error: Path '{file_path}' is outside authorized project workspace."
+        if _is_git_metadata(full_path):
+            return f"Error: '{file_path}' is git metadata, which this server does not read or modify."
 
         if not os.path.isfile(full_path):
             return f"Error: File '{file_path}' does not exist."
@@ -397,10 +412,26 @@ _SHELL_CHAINING = (";", "&&", "||", "`", "$(")
 # Windows runs .cmd/.bat files through cmd.exe, which interprets these even
 # though we never pass shell=True.
 _BATCH_METACHARACTERS = set("&|<>^%!\"")
+# The command runs in a copy of the project, so every path in it must be relative to the
+# project. An absolute path would point back at the real files (or anywhere else on disk):
+# `pytest --basetemp=<dir>` empties that directory, `--junitxml=<file>` overwrites a file.
+_ABSOLUTE_PATH = re.compile(r"""(?:^|[=:,;\s"'@])(?:[\\/]|~|[A-Za-z]:[\\/])""")
+_PARENT_PATH = re.compile(r"""(?:^|[\\/=:,;\s"'@])\.\.(?:[\\/]|$)""")
+# Options that make a test runner start a program or evaluate code named on the command line.
+_PROGRAM_OPTIONS = {
+    "go": ("-exec", "-toolexec"),
+    "cargo": ("--config",),
+    "npm": ("--script-shell",),
+    "node": ("-e", "--eval", "-p", "--print", "-i", "--interactive"),
+}
 
 
 def _validate_test_command(args: list[str]) -> str | None:
     """Error message if `args` is not an allowed test-runner invocation, else None."""
+    for arg in args:
+        if _ABSOLUTE_PATH.search(arg) or _PARENT_PATH.search(arg):
+            return (f"Error: '{arg}' is not allowed in a test command: tests run in a copy of the project, so "
+                    "paths must be relative to the project root (no absolute paths, `~` or `..`).")
     exe = os.path.basename(args[0]).lower()
     for suffix in (".exe", ".cmd", ".bat"):
         exe = exe[:-len(suffix)] if exe.endswith(suffix) else exe
@@ -425,6 +456,12 @@ def _validate_test_command(args: list[str]) -> str | None:
         ok = False
     if not ok:
         return f"Error: '{' '.join(args)}' is not an allowed test command. Allowed: {'; '.join(ALLOWED_TEST_COMMANDS)}."
+    for arg in rest:
+        option = arg.split("=", 1)[0].lstrip("-")
+        if arg.startswith("-") and any(option == blocked.lstrip("-") for blocked in _PROGRAM_OPTIONS.get(exe, ())):
+            return f"Error: option '{arg.split('=', 1)[0]}' is not allowed in a test command (it runs another program or code)."
+    if exe == "mvn" and any(":" in a for a in rest if not a.startswith("-")):
+        return "Error: only Maven lifecycle phases are allowed in a test command, not plugin goals (`plugin:goal`)."
     return None
 
 
@@ -831,8 +868,8 @@ def _modernized_source(path: str, original: str, modernized_code: str = ""
         # The organization's standards last, so their fixes win.
         new, standard_notes = _standards().apply_fixes(new, _rel(path))
         return new, notes + learned_notes + standard_notes, None
-    if path.endswith((".ts", ".tsx", ".js", ".jsx")):
-        new, notes = CodeModernizer.modernize_typescript(original)
+    if path.lower().endswith(_SCRIPT_EXTENSIONS):
+        new, notes = CodeModernizer.modernize_typescript(original, path)
         return new, notes, None
     return None, [], "Error: Automated modernization rules not implemented for this file extension"
 
@@ -852,6 +889,8 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
 
         if not is_path_in_workspace(full_path):
             return f"Error: Path '{file_path}' is outside authorized project workspace."
+        if _is_git_metadata(full_path):
+            return f"Error: '{file_path}' is git metadata, which this server does not read or modify."
 
         if not os.path.isfile(full_path):
             return f"Error: File '{file_path}' does not exist."
@@ -887,18 +926,52 @@ def apply_code_modernization(file_path: str, modernized_code: str = "") -> str:
 
 
 _PYTEST_AVAILABLE: dict = {}
+_SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 
 
-def _default_test_command(ctx: dict | None) -> str:
-    """Tests that import the file (from the import graph) if any, else the whole suite."""
+def _has_pytest(python: str) -> bool:
+    """
+    Whether `python` can run pytest, found without running anything from the workspace:
+    this happens outside the sandbox, where `import pytest` in the project directory would
+    execute a `pytest.py` planted there, and a virtualenv inside the workspace is itself
+    project content.
+    """
+    import glob
+    import importlib.util
+    import tempfile
+
+    if os.path.normcase(os.path.abspath(python)) == os.path.normcase(os.path.abspath(sys.executable)):
+        return importlib.util.find_spec("pytest") is not None
+    if is_path_in_workspace(python):
+        venv = os.path.dirname(os.path.dirname(os.path.abspath(python)))
+        site_dirs = [os.path.join(venv, "Lib", "site-packages"), *glob.glob(os.path.join(venv, "lib", "python*", "site-packages"))]
+        return any(os.path.isdir(os.path.join(d, "pytest")) or os.path.isfile(os.path.join(d, "pytest.py"))
+                   for d in site_dirs)
+    try:  # NOVUS_PYTHON: an interpreter the user configured; isolated mode, neutral directory
+        return subprocess.run(
+            [python, "-I", "-c", "import importlib.util, sys; sys.exit(importlib.util.find_spec('pytest') is None)"],
+            cwd=tempfile.gettempdir(), stdin=subprocess.DEVNULL, capture_output=True, timeout=60).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _default_test_command(ctx: dict | None, file_path: str = "") -> str:
+    """
+    Tests that import the file (from the import graph) if any, else the whole suite. For a
+    JavaScript/TypeScript file: `npm test` if the project defines it, else "" (the Python
+    suite says nothing about a script change, so there is no default to fall back on).
+    """
+    if file_path.lower().endswith(_SCRIPT_EXTENSIONS):
+        import json
+        try:
+            with open(os.path.join(WORKSPACE_ROOT, "package.json"), encoding="utf-8") as f:
+                scripts = json.load(f).get("scripts") or {}
+        except (OSError, ValueError, AttributeError):
+            scripts = {}
+        return "npm test" if isinstance(scripts, dict) and scripts.get("test") else ""
     python = _python_interpreter()
     if python not in _PYTEST_AVAILABLE:
-        try:
-            _PYTEST_AVAILABLE[python] = subprocess.run(
-                [python, "-c", "import pytest"], cwd=WORKSPACE_ROOT, capture_output=True, timeout=60
-            ).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            _PYTEST_AVAILABLE[python] = False
+        _PYTEST_AVAILABLE[python] = _has_pytest(python)
     tests = (ctx or {}).get("related_tests", [])
     if _PYTEST_AVAILABLE[python]:
         return "python -m pytest -q " + " ".join(shlex.quote(t) for t in tests) if tests else "python -m pytest -q"
@@ -942,6 +1015,8 @@ def run_autonomous_modernization_pipeline(
     full_path = _resolve_workspace_path(file_path)
     if not is_path_in_workspace(full_path):
         return f"Error: Path '{file_path}' is outside authorized project workspace."
+    if _is_git_metadata(full_path):
+        return f"Error: '{file_path}' is git metadata, which this server does not read or modify."
     try:
         repo = git.Repo(WORKSPACE_ROOT)
     except (git.InvalidGitRepositoryError, git.NoSuchPathError):
@@ -961,6 +1036,7 @@ def run_autonomous_modernization_pipeline(
     audit_res = analyze_legacy_codebase(file_path)
     start_point = branch_name if branch_name in [b.name for b in repo.branches] else "HEAD"
     wt_root = tempfile.mkdtemp(prefix="novus-worktree-")
+    sandbox.allow_sandbox_writes(wt_root)  # before the checkout exists, so every file in it inherits the label
     wt = os.path.join(wt_root, "wt")
     try:
         repo.git.worktree("add", "--detach", wt, start_point)
@@ -1009,10 +1085,13 @@ def run_autonomous_modernization_pipeline(
         if broken:
             return (f"❌ Pipeline stopped: the modernized file would no longer provide "
                     f"{', '.join(f'`{n}`' for n in broken)}, which other modules import. Nothing was changed.")
+        command = test_command.strip() or _default_test_command(ctx, rel)
+        if not command:
+            return (f"❌ Pipeline stopped: no tests to verify `{file_path}` with. The project's `package.json` has no "
+                    "`test` script; pass `test_command` (for example `npx jest`). Nothing was changed.")
         _write_source(wt_file, new_code, newline)
 
         sandbox.link_dependency_dirs(WORKSPACE_ROOT, wt)
-        command = test_command.strip() or _default_test_command(ctx)
         exit_code, test_res = _execute_test_command(command, workspace=wt, disposable=True)
         if exit_code != 0:
             reason = "could not be run" if exit_code is None else f"failed (exit code {exit_code})"
@@ -1074,7 +1153,7 @@ def format_modernization_report(
     try:
         audit_res = analyze_legacy_codebase(file_path)
         ctx, _reason = _codebase_context(file_path)
-        command = test_command.strip() or _default_test_command(ctx)
+        command = test_command.strip() or _default_test_command(ctx, file_path)
         exit_code, test_res = _execute_test_command(command)
         mod_details = (f"Rule-engine / LLM modernization of `{file_path}`. "
                        f"Verification `{command}` exit code: {exit_code}.")
@@ -1663,7 +1742,16 @@ def main(argv: list[str] | None = None) -> None:
         if args.host not in ("127.0.0.1", "localhost", "::1"):
             print(f"WARNING: serving on {args.host} without authentication; anyone who can reach it can read "
                   f"and modify {WORKSPACE_ROOT}.", file=sys.stderr)
-        mcp.run(transport="http", host=args.host, port=args.port, show_banner=False, log_level="CRITICAL")
+        # Without authentication, the Host/Origin check is what stops a web page in the user's
+        # browser from reaching a local server (DNS rebinding). FastMCP leaves it off by default.
+        import inspect
+        guard = {"host_origin_protection": "auto"} \
+            if "host_origin_protection" in inspect.signature(mcp.run_http_async).parameters else {}
+        if not guard:
+            print("WARNING: this FastMCP version cannot validate Host/Origin headers; a web page open in your "
+                  "browser may be able to reach this server. Upgrade fastmcp or use the stdio transport.",
+                  file=sys.stderr)
+        mcp.run(transport="http", host=args.host, port=args.port, show_banner=False, log_level="CRITICAL", **guard)
     else:
         mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
 
