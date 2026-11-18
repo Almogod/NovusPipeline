@@ -60,6 +60,55 @@ Claude Code: `claude mcp add novuspipeline -- uvx --from "novuspipeline[gnn]" no
 
 Then ask your agent to use the `modernization_workflow` prompt, or call `get_codebase_overview` to start.
 
+## ⌨️ Fix a project from the terminal
+
+No AI assistant or API key needed. Run it, paste your project folder, and it fixes everything it can:
+
+```text
+$ uvx novuspipeline
+NovusPipeline 0.1.0  modernize legacy code, test-gated
+
+Project folder (paste a path, Enter for the current folder): C:\code\billing
+
+Scanning
+  48 source file(s) checked, 6 with automatic fixes
+  • app/net.py Migrated Python 2 `urllib2` to its Python 3 equivalents +1 more
+  ...
+Each file is rewritten in a separate checkout, verified with your tests in a sandbox, and
+committed to novus/modernize-20261118-164652 only if they pass. Start fixing? [Y/n]
+
+Fixing
+  [1/6] ✔ app/net.py  fixed and committed (1.6s)
+  [2/6] ✖ app/maths.py  not committed: tests failed after the rewrite (2.2s)
+  ...
+Bring the fixes into `main` now (fast-forward)? [y/N]
+```
+
+- Your files and your checked-out branch are untouched until you choose to bring the fixes in. Every fix is a separate commit on a new `novus/modernize-<time>` branch, ready to review, merge or push as a PR.
+- A file is committed only when your tests pass with the change. Files whose tests failed get one more try on top of the other fixes, since tests often import several legacy modules at once. A file no test covers is not committed: add tests, pass `--test-command`, or pass `--allow-untested` to commit after a compile/import check and review the diff yourself.
+- Test files are not rewritten, because they are the safety net (`--include-tests` to change that). Files with uncommitted changes are skipped.
+- If the folder is not a git repository yet, it offers to create one and commit the current files as the starting point.
+
+Without questions, for scripts and CI: `novuspipeline fix /path/to/project --yes` (add `--merge` to fast-forward your branch to the fixes, `--branch NAME` to choose the branch).
+
+### Individual commands
+
+Every MCP tool is also a terminal command:
+
+```sh
+novuspipeline overview                      # files ranked by modernization risk
+novuspipeline audit src/db.py               # findings for one file
+novuspipeline context src/db.py             # dependents, used symbols, related tests
+novuspipeline modernize src/db.py           # one file: rewrite + test + commit on a branch
+novuspipeline standards install secure-defaults
+novuspipeline test python -m pytest         # run tests in the sandbox
+novuspipeline --workspace /path/to/project overview
+```
+
+Also: `index`, `gnn`, `similar`, `history`, `guidelines search|show|stats`, `status`, and `apply` (rewrites in place with a `.bak`; asks first, `--yes` to skip). `novuspipeline <command> --help` lists each command's options. The exit code is non-zero when a command fails, or when `test` runs failing tests, so it works in CI.
+
+`novuspipeline` with no command opens the guided mode only in a terminal. MCP clients launch it without one and get the MCP server, exactly as before (`novuspipeline serve` forces the server).
+
 ## ⚙️ Settings
 
 | Option | Purpose |
@@ -73,6 +122,7 @@ Then ask your agent to use the `modernization_workflow` prompt, or call `get_cod
 | `NOVUS_LLM_PATH` | Optional LoRA adapter directory |
 | `NOVUS_LLM_PYTHON` | Run the LLM worker in a separate (GPU) environment |
 | `NOVUS_LLM_OFFLINE=1` | Never download models; use the local Hugging Face cache only |
+| `NOVUS_BASELINE=0` | Turn off the built-in security baseline (blocks `verify=False`, binding `0.0.0.0`, `raise` without `from` in `except`) |
 | `NOVUS_LEARN_FROM_HISTORY=0` | Don't mine git history in the background after indexing |
 | `NOVUS_SANDBOX=docker`, `NOVUS_SANDBOX_IMAGE` | Run tests in a container with no network (the image must contain your test dependencies) |
 | `NOVUS_SANDBOX_MEMORY_MB`, `NOVUS_SANDBOX_MAX_PROCESSES` | Sandbox limits for test runs (default 4096 MB, 256 processes) |
@@ -189,7 +239,7 @@ Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`
 | Guidelines (RAG) | `query_rag_guidelines`, `search_rag_by_id`, `ingest_rag_document`, `remove_rag_document`, `get_rag_stats`, `reset_rag_database` |
 | Status | `get_gnn_model_status`, `get_local_llm_status` |
 
-`run_autonomous_modernization_pipeline` never touches your working copy. It modernizes the file in a disposable git worktree, runs the tests that import the file in the sandbox, rejects the change if the tests fail or if a symbol other modules import would disappear, and commits only that file to a branch (`branch_name`, default `auto-modernization-branch`; repeated calls add commits to it). It refuses to run on a file with uncommitted changes, or with your checked-out branch as the target. A PR description draft is written to `.novus_index/prs/`.
+`run_autonomous_modernization_pipeline` never touches your working copy. It modernizes the file in a disposable git worktree, runs the tests that import the file in the sandbox, rejects the change if the tests fail or if a symbol other modules import would disappear, and commits only that file to a branch (`branch_name`, default `auto-modernization-branch`; repeated calls add commits to it). A run in which zero tests executed is not a pass: nothing is committed unless you pass `allow_untested=true`, and then only after the file compiles and imports in the sandbox; every result starts with a `Verification:` line saying which. It refuses to run on a file with uncommitted changes, or with your checked-out branch as the target. A PR description draft is written to `.novus_index/prs/`.
 
 ### 🛡️ Sandbox
 

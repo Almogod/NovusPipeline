@@ -6,6 +6,28 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **A run where zero tests executed is no longer a pass.** `run_autonomous_modernization_pipeline` used to
+  commit when a project without tests exited 0. It now refuses, unless `allow_untested=true`, and even then
+  only after a built-in floor check (the file must compile and import in the sandbox; an import that also
+  fails on the original file is reported as inconclusive). Every result, PR draft and report starts with a
+  `Verification:` line saying how many tests ran, or that none did.
+
+### Added
+- Built-in `baseline` security pack, active with no configuration: it blocks commits of files containing
+  `verify=False` (S501), binding all interfaces (S104) and `raise` inside `except` without a cause (B904).
+  Install a copy with `install_standard_pack baseline` to edit it, set `NOVUS_BASELINE=0` to turn it off, or
+  mark a reviewed line `# noqa: S104`. Packs can now list Ruff codes under `[ruff] block`.
+- Guided terminal mode: `novuspipeline` in a terminal asks for a project folder, then fixes every
+  file it can, each test-gated and committed to a new `novus/modernize-<time>` branch; files whose
+  tests failed are retried on top of the other fixes. `novuspipeline fix PATH --yes` does the same
+  without questions (`--merge` fast-forwards your branch to the fixes, `--allow-untested` passes
+  through to the pipeline).
+- Command line interface: `overview`, `audit`, `context`, `modernize`, `apply`, `test`, `standards`,
+  `guidelines`, `history`, `index`, `gnn`, `similar`, `status`, backed by the same functions as the MCP
+  tools. Launched by an MCP client (no terminal), `novuspipeline` still starts the MCP server.
+- `.novus_index/` contains its own `.gitignore`, so it no longer shows up in `git status`.
+
 ### Security
 - Test commands may no longer contain absolute paths, `~` or `..`: they pointed
   out of the sandbox copy at real files (`pytest --basetemp=<dir>` empties that

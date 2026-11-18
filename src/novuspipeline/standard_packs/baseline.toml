@@ -1,0 +1,29 @@
+# Built-in security baseline. It is active in every workspace that has not installed its own
+# copy, so a first run is never "no standards, nothing enforced".
+#
+#   * To change it: install it with `install_standard_pack baseline`, then edit the copy in
+#     .novus/standards/baseline.toml (the copy replaces the built-in one entirely).
+#   * To turn it off: set NOVUS_BASELINE=0.
+#   * To allow one reviewed exception, annotate that line: `# noqa: S104`.
+
+[pack]
+name = "baseline"
+description = "Security baseline that blocks commits: TLS verification off (S501), binding all interfaces (S104), raise without cause in except (B904)"
+
+# Ruff reports these codes; `block` turns them into commit blockers (like `enforce = "block"`).
+# S501 is covered by the SEC-TLS-VERIFY rule below, so Ruff does not report it twice.
+[ruff]
+select = ["S104", "B904"]
+ignore = ["S501"]
+block = ["S104", "B904"]
+
+[[rule]]
+id = "SEC-TLS-VERIFY"
+title = "Never disable TLS certificate verification"
+severity = "HIGH"
+enforce = "block"
+pattern = '\bverify\s*=\s*False\b'
+guideline = """
+`verify=False` accepts any certificate, so connections can be intercepted. Point
+`verify=` at your CA bundle instead (e.g. an internal CA path) or fix the server certificate.
+"""

@@ -39,6 +39,7 @@ import re
 import threading
 from typing import Any
 
+from . import ruff_backend
 from .code_facts import dotted
 from .modernizer import mask_strings_and_comments
 
@@ -53,6 +54,16 @@ _STR_FIELDS = ("title", "guideline", "category", "severity", "enforce", "pattern
                "replace_call", "replace_import", "add_keyword", "replacement")
 _RULE_FIELDS = {"id", *_LIST_FIELDS, *_STR_FIELDS}
 _SCRIPT_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+
+
+BASELINE_PATH = os.path.join(BUILTIN_DIR, "baseline.toml")
+
+
+def baseline_active(workspace: str) -> bool:
+    """The built-in baseline applies unless NOVUS_BASELINE=0 or the user/project installed their own copy."""
+    if os.environ.get("NOVUS_BASELINE", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    return not any(os.path.isfile(os.path.join(scope_dir(workspace, s), "baseline.toml")) for s in ("user", "project"))
 
 
 def user_dir() -> str:
@@ -140,7 +151,10 @@ class Standards:
         self.errors: list[str] = []
         self.ruff_select: list[str] = []
         self.ruff_ignore: list[str] = []
+        self.ruff_block: list[str] = []
         by_id: dict[str, dict[str, Any]] = {}
+        if baseline_active(workspace):  # lowest priority: user and project packs override by rule id
+            self._load_pack(BASELINE_PATH, "builtin", by_id)
         for scope in ("user", "project"):
             for path in sorted(glob.glob(os.path.join(scope_dir(workspace, scope), "*.toml"))):
                 self._load_pack(path, scope, by_id)
@@ -171,6 +185,12 @@ class Standards:
         ruff = data.get("ruff") or {}
         self.ruff_select += [str(c) for c in ruff.get("select", [])]
         self.ruff_ignore += [str(c) for c in ruff.get("ignore", [])]
+        for code in ruff.get("block", []):
+            if re.fullmatch(r"[A-Z]+[0-9]+", str(code)):
+                self.ruff_block.append(str(code))
+                self.ruff_select.append(str(code))  # a code that blocks must also be reported
+            else:
+                self.errors.append(f"`{shown}`: `[ruff] block` entry `{code}` is not a Ruff rule code")
         self.packs.append({"name": name, "description": str(meta.get("description", "")), "scope": scope,
                            "path": shown, "rules": loaded})
 
@@ -273,7 +293,13 @@ class Standards:
         return bool(rule["replace_call"] or rule["replace_import"] or rule["add_keyword"] or rule["replacement"])
 
     def blocking(self, code: str, rel_path: str) -> list[dict[str, Any]]:
-        return [f for f in self.scan(code, rel_path) if f["enforce"] == "block"]
+        """Findings that stop a commit: `enforce = "block"` rules plus Ruff codes listed in `[ruff] block`."""
+        found = [f for f in self.scan(code, rel_path) if f["enforce"] == "block"]
+        if self.ruff_block and rel_path.lower().endswith((".py", ".pyw")):
+            wanted = {f"RUFF-{c}" for c in self.ruff_block}
+            found += [f for f in ruff_backend.scan_code(code, rel_path, extend_select=self.ruff_block)
+                      if f["smell_id"] in wanted]
+        return sorted(found, key=lambda f: (f["line_number"], f["smell_id"]))
 
     # ---------------------------------------------------------------- fixes
 
@@ -418,7 +444,7 @@ _CACHE_LOCK = threading.Lock()
 
 
 def signature(workspace: str) -> str:
-    parts = []
+    parts = [f"baseline:{baseline_active(workspace)}"]
     for scope in ("user", "project"):
         for path in sorted(glob.glob(os.path.join(scope_dir(workspace, scope), "*.toml"))):
             with contextlib.suppress(OSError):

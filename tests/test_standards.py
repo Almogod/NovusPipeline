@@ -1,6 +1,7 @@
 """Organization / industry modernization standards (rule packs)."""
 import os
 import unittest
+from unittest import mock
 
 from novuspipeline import local_llm, standards
 from novuspipeline.server import (
@@ -187,6 +188,61 @@ class TestStandardsInTools(StandardsTestCase):
         self.assertIn("Violates organization standards: SEC-TIMEOUT", "; ".join(v["issues"]))
         self.assertIn("SEC-TIMEOUT, violated in this file",
                       active.prompt_block(active.scan("import requests\nrequests.get('u')\n", "a.py")))
+
+
+INSECURE = (
+    "import httpx\n\n\n"
+    "def get(url: str):\n    return httpx.get(url, verify=False)\n\n\n"
+    "def serve(app):\n    app.run(host='0.0.0.0')\n\n\n"
+    "def load(path: str):\n    try:\n        return open(path).read()\n    except OSError as e:\n"
+    "        raise RuntimeError('cannot load')\n"
+)
+
+
+class TestBaseline(StandardsTestCase):
+    """The built-in security baseline: active with no configuration, blocks S501 / S104 / B904."""
+
+    def blocked(self, code: str = INSECURE) -> set[str]:
+        return {f["smell_id"] for f in standards.load(self.root).blocking(code, "svc.py")}
+
+    def test_active_without_any_configuration(self):
+        active = standards.load(self.root)
+        self.assertIn("baseline", {p["name"] for p in active.packs})
+        self.assertEqual(self.blocked(), {"SEC-TLS-VERIFY", "RUFF-S104", "RUFF-B904"})
+        self.assertIn("baseline", list_modernization_standards())
+
+    def test_clean_code_and_reviewed_exceptions_pass(self):
+        clean = ("import httpx\n\n\ndef get(url: str):\n    return httpx.get(url, verify='/etc/ca.pem')\n\n\n"
+                 "def serve(app):\n    app.run(host='0.0.0.0')  # noqa: S104\n\n\n"
+                 "def load(path: str):\n    try:\n        return open(path).read()\n    except OSError as e:\n"
+                 "        raise RuntimeError('cannot load') from e\n")
+        self.assertEqual(self.blocked(clean), set())
+
+    def test_can_be_disabled_by_environment(self):
+        with mock.patch.dict(os.environ, {"NOVUS_BASELINE": "0"}):
+            self.assertEqual(self.blocked(), set())
+            self.assertNotIn("baseline", {p["name"] for p in standards.load(self.root).packs})
+
+    def test_installed_copy_replaces_the_builtin_one(self):
+        install_standard_pack("baseline")
+        active = standards.load(self.root)
+        self.assertEqual([p["scope"] for p in active.packs if p["name"] == "baseline"], ["project"])
+        self.assertEqual(len([r for r in active.rules if r["id"] == "SEC-TLS-VERIFY"]), 1)
+        path = os.path.join(self.root, ".novus", "standards", "baseline.toml")
+        with open(path, encoding="utf-8") as f:
+            text = f.read().replace('block = ["S104", "B904"]', 'block = ["B904"]')
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        self.assertEqual(self.blocked(), {"SEC-TLS-VERIFY", "RUFF-B904"})  # the team relaxed S104
+
+    def test_pipeline_refuses_to_commit_a_file_with_baseline_violations(self):
+        self.write("svc.py", INSECURE)
+        self.commit_all()
+        res = run_autonomous_modernization_pipeline("svc.py", test_command="python --version", branch_name="base")
+        self.assertIn("still violates blocking standards", res)
+        for smell in ("SEC-TLS-VERIFY", "RUFF-S104", "RUFF-B904"):
+            self.assertIn(smell, res)
+        self.assertNotIn("base", [b.name for b in self.repo.branches])
 
 
 if __name__ == "__main__":

@@ -182,6 +182,10 @@ class CodebaseIndex:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
+        ignore = os.path.join(os.path.dirname(self.index_path), ".gitignore")
+        if not os.path.exists(ignore):  # keep the index out of the user's `git status` without editing theirs
+            with open(ignore, "w", encoding="utf-8") as f:
+                f.write("*\n")
         tmp = self.index_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"version": INDEX_VERSION, "meta": self.meta, "files": self.files}, f)

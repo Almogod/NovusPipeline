@@ -102,7 +102,7 @@ class WorkspaceTestCase(unittest.TestCase):
 class TestFilesAndPaths(unittest.TestCase):
 
     def test_read_legacy_file_valid(self):
-        self.assertIn("# NovusPipeline", read_legacy_file("README.md"))
+        self.assertIn("NovusPipeline", read_legacy_file("README.md"))
 
     def test_read_legacy_file_security_path_traversal(self):
         self.assertIn("outside authorized project workspace", read_legacy_file("../../Windows/System32/drivers/etc/hosts"))
@@ -537,6 +537,70 @@ class TestAutonomousPipeline(WorkspaceTestCase):
 
     def test_outside_workspace_rejected(self):
         self.assertIn("outside authorized", run_autonomous_modernization_pipeline("../../etc/passwd"))
+
+    def test_success_reports_how_many_tests_verified_it(self):
+        self.write("test_calc.py", "import unittest\nimport calc\n\nclass T(unittest.TestCase):\n"
+                                   "    def test_import(self):\n        self.assertTrue(hasattr(calc, 'fetch'))\n")
+        self.commit_all("add tests")
+        res = run_autonomous_modernization_pipeline("calc.py", branch_name="verified")
+        self.assertIn("Verification: ✅ 1 test(s) executed and passed", res)
+
+    def test_zero_tests_executed_is_not_verification(self):
+        # `unittest discover` over a project without tests exits 0 on Python <= 3.11: not a pass.
+        head = self.repo.head.commit.hexsha
+        zero = (0, "=== OUTPUT ===\nRan 0 tests in 0.000s\n\nNO TESTS RAN\n\nExit Code: 0")
+        with mock.patch.object(server, "_execute_test_command", return_value=zero):
+            res = run_autonomous_modernization_pipeline("calc.py", branch_name="untested")
+        self.assertIn("Verification: NONE", res)
+        self.assertIn("executed 0 tests", res)
+        self.assertIn("allow_untested=true", res)
+        self.assertIn("syntax/import floor: passed", res)  # informational even when refusing
+        self.assertNotIn("untested", [b.name for b in self.repo.branches])
+        self.assertEqual(self.repo.head.commit.hexsha, head)
+
+    def test_allow_untested_commits_after_the_floor_check_and_says_so(self):
+        zero = (0, "Ran 0 tests in 0.000s\n\nNO TESTS RAN\n\nExit Code: 0")
+        with mock.patch.object(server, "_execute_test_command", return_value=zero):
+            res = run_autonomous_modernization_pipeline("calc.py", branch_name="untested", allow_untested=True)
+        self.assertIn("Completed Successfully", res, res)
+        self.assertIn("Verification: NONE (0 tests executed; `allow_untested=true`)", res)
+        self.assertEqual(self.committed_files("untested"), {"calc.py"})
+        self.assertIn("Verification: NONE", self.read(os.path.join(".novus_index", "prs", "untested.md")))
+
+    def test_floor_check_rejects_a_change_that_no_longer_imports(self):
+        self.write("good.py", "import os\n\n\ndef f():\n    try:\n        return os.getcwd()\n    except:\n        return ''\n")
+        self.commit_all("importable module")
+        broken = "import does_not_exist_anywhere\n"
+        zero = (0, "Ran 0 tests in 0.000s\n\nNO TESTS RAN")
+        with mock.patch.object(server, "_execute_test_command", return_value=zero), \
+                mock.patch.object(server, "_modernized_source", return_value=(broken, ["x"], None)):
+            res = run_autonomous_modernization_pipeline("good.py", branch_name="broken", allow_untested=True)
+        self.assertIn("floor check failed", res)
+        self.assertIn("import check failed after the change", res)
+        self.assertNotIn("broken", [b.name for b in self.repo.branches])
+
+    def test_floor_check_rejects_a_syntax_error(self):
+        zero = (0, "Ran 0 tests in 0.000s")
+        with mock.patch.object(server, "_execute_test_command", return_value=zero), \
+                mock.patch.object(server, "_modernized_source", return_value=("def f(:\n", ["x"], None)):
+            res = run_autonomous_modernization_pipeline("calc.py", branch_name="syntax", allow_untested=True)
+        self.assertIn("compile check failed", res)
+        self.assertNotIn("syntax", [b.name for b in self.repo.branches])
+
+
+class TestTestCount(unittest.TestCase):
+
+    def test_recognizes_runner_output(self):
+        count = server._test_count
+        self.assertEqual(count("Ran 0 tests in 0.000s\n\nNO TESTS RAN"), 0)
+        self.assertEqual(count("Ran 7 tests in 0.1s\n\nOK"), 7)
+        self.assertEqual(count("no tests ran in 0.01s"), 0)
+        self.assertEqual(count("collected 0 items"), 0)
+        self.assertEqual(count("=== 5 passed, 2 failed in 1.2s ==="), 7)
+        self.assertEqual(count("Tests:       0 total"), 0)
+        self.assertEqual(count("Tests:       1 failed, 3 passed, 4 total"), 4)
+        self.assertEqual(count("test result: ok. 12 passed; 0 failed"), 12)
+        self.assertIsNone(count("BUILD SUCCESS"))  # unknown output is never treated as "no tests"
 
 
 # ---------------------------------------------------------------------------

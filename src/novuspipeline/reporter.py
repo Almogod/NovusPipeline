@@ -23,14 +23,16 @@ class ModernizationReporter:
         branch_name: str,
         model_used: str = "rule engine + structural GNN (optional local LLM)",
         pr_draft_file: str = "",
+        verification: str = "",
     ) -> str:
         """Constructs an enterprise-grade Markdown report artifact."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
         file_name = os.path.basename(file_path)
 
+        banner = f"> **{verification}**\n\n" if verification else ""
         report = f"""# 🚀 NovusPipeline Codebase Modernization Report
 
-- **Target File**: `{file_path}`
+{banner}- **Target File**: `{file_path}`
 - **Git Branch**: `{branch_name}`
 - **Generated At**: `{timestamp}`
 - **LLM Engine**: `{model_used}`

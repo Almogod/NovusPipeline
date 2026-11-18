@@ -980,12 +980,79 @@ def _default_test_command(ctx: dict | None, file_path: str = "") -> str:
     return "python -m unittest discover"
 
 
+def _test_count(output: str) -> int | None:
+    """
+    How many tests a runner executed, from its output: a number (0 means none ran) or None when
+    the runner's output is not recognized (unknown is treated as "ran", never as "none").
+    """
+    m = re.search(r"^Ran (\d+) tests? in", output, re.M)  # unittest
+    if m:
+        return int(m.group(1))
+    if re.search(r"no tests ran|collected 0 items|no tests collected|no tests found|running 0 tests|"
+                 r"\[no test files\]|^Tests:\s+0 total|# tests 0\b", output, re.I | re.M):
+        return 0
+    counts = re.findall(r"\b(\d+) (?:passed|failed|errors?)\b", output)  # pytest summary line
+    if counts:
+        return sum(int(c) for c in counts)
+    m = re.search(r"^Tests:\s+.*?(\d+) total", output, re.M)  # jest / vitest
+    if m:
+        return int(m.group(1))
+    m = re.search(r"# tests (\d+)", output)  # node --test
+    if m:
+        return int(m.group(1))
+    m = re.search(r"test result: \w+\. (\d+) passed", output)  # cargo
+    return int(m.group(1)) if m else None
+
+
+_IMPORT_SMOKE = (
+    "import importlib.util, sys\n"
+    "spec = importlib.util.spec_from_file_location('novus_import_smoke', sys.argv[1])\n"
+    "module = importlib.util.module_from_spec(spec)\n"
+    "spec.loader.exec_module(module)\n"
+)
+
+
+def _floor_check(wt: str, rel: str, wt_file: str, original: str, new_code: str, newline: str) -> tuple[bool, str]:
+    """
+    The minimum verification when a project has no tests: the modernized Python file must compile
+    and import in the sandbox. A failing import only counts against the change if the original
+    file imports fine (a module that needs a missing dependency or a live service fails either
+    way, which says nothing about this change). Returns (passed, one-line summary + details).
+    """
+    if not rel.endswith(".py"):
+        return False, "the syntax/import floor only covers Python files"
+    python = _python_interpreter()
+
+    def run(args: list[str]) -> tuple[bool, str]:
+        try:
+            res = sandbox.run(args, wt, TEST_TIMEOUT_SECONDS, copy=False)
+        except OSError as e:
+            return False, str(e)
+        return res.exit_code == 0 and not res.timed_out, "timed out" if res.timed_out else _truncate(res.output, 1500)
+
+    ok, out = run([python, "-m", "py_compile", rel])
+    if not ok:
+        return False, f"compile check failed:\n{out}"
+    ok, out = run([python, "-c", _IMPORT_SMOKE, rel])
+    if ok:
+        return True, "compiles and imports cleanly"
+    _write_source(wt_file, original, newline)  # does the original import?
+    try:
+        original_ok, _ = run([python, "-c", _IMPORT_SMOKE, rel])
+    finally:
+        _write_source(wt_file, new_code, newline)
+    if original_ok:
+        return False, f"import check failed after the change (it imported before):\n{out}"
+    return True, "compiles; import check inconclusive (the original file fails to import too, e.g. missing dependency)"
+
+
 @_tool("write", timeout=3600)
 def run_autonomous_modernization_pipeline(
     file_path: str,
     test_command: str = "",
     branch_name: str = "auto-modernization-branch",
     use_llm: bool = False,
+    allow_untested: bool = False,
 ) -> str:
     """
     Codebase-aware, sandboxed modernization of one file. Everything happens in a disposable
@@ -998,8 +1065,11 @@ def run_autonomous_modernization_pipeline(
          still violates a standard with `enforce = "block"`.
       4. Runs verification tests in the sandbox: `test_command`, or by default the tests
          that import this file (falling back to the whole suite).
-      5. Exit code 0 -> commits only this file on `branch_name` (created at HEAD, or extended
-         if it exists) and drafts a PR with blast radius and follow-up files.
+      5. Exit code 0 AND at least one test executed -> commits only this file on `branch_name`
+         (created at HEAD, or extended if it exists) and drafts a PR with blast radius and
+         follow-up files. A run where zero tests executed is NOT verification: nothing is
+         committed unless `allow_untested=true`, and then only if the file also compiles and
+         imports in the sandbox. The result starts with a `Verification:` line that says which.
 
     Args:
         file_path:    Target legacy file to modernize (must have no uncommitted changes).
@@ -1007,6 +1077,8 @@ def run_autonomous_modernization_pipeline(
         branch_name:  Branch that receives the commit (default 'auto-modernization-branch').
         use_llm:      Try the local LLM first; its proposal is used only if it passes
                       validation (parses, no new smells, imported symbols kept). Tests gate both.
+        allow_untested: Commit even when the project has no tests (zero tests executed), after the
+                      syntax/import floor check passes. Off by default: review the diff yourself.
     """
     import tempfile
 
@@ -1098,6 +1170,24 @@ def run_autonomous_modernization_pipeline(
             return (f"❌ Autonomous Modernization Pipeline: verification `{command}` {reason}. "
                     f"The change was discarded; your working copy was never modified.\n\nTest Output:\n{test_res}")
 
+        count = _test_count(test_res)
+        if count == 0:  # exit 0 with nothing executed proves nothing
+            floor_ok, floor_note = _floor_check(wt, rel, wt_file, original, new_code, newline)
+            floor = f"syntax/import floor: {'passed' if floor_ok else 'FAILED'}: {floor_note}"
+            if not allow_untested or not floor_ok:
+                why = ("The change was not committed because the floor check failed."
+                       if allow_untested else
+                       "Nothing was committed. Add tests (a pipeline run is only as trustworthy as the tests behind it), "
+                       "or re-run with `allow_untested=true` to commit after the floor check and review the diff yourself.")
+                return (f"❌ Verification: NONE. `{command}` executed 0 tests, so a passing exit code means nothing "
+                        f"for `{file_path}`.\n{floor}\n{why}\n\nTest Output:\n{test_res}")
+            verification = (f"⚠️ Verification: NONE (0 tests executed; `allow_untested=true`). Only the {floor}. "
+                            "Review the diff before merging.")
+        elif count is None:
+            verification = f"Verification: `{command}` exited 0 (test count not reported by this runner)."
+        else:
+            verification = f"Verification: ✅ {count} test(s) executed and passed (`{command}`)."
+
         wt_repo = git.Repo(wt)
         wt_repo.git.add("--", rel)
         wt_repo.git.commit("-m", f"refactor: autonomous modernization of {os.path.basename(rel)}", "--", rel)
@@ -1109,11 +1199,11 @@ def run_autonomous_modernization_pipeline(
         pr_path = _write_pr_draft(
             branch_name, f"Autonomous Modernization: {os.path.basename(rel)}",
             f"### Modernization Audit\n{audit_res}\n\n### Applied Changes\n{engine_note}\n{changes}\n\n"
-            f"### Test Verification\nPassed (exit code 0): `{command}`\n\n### Impact\n{impact}")
+            f"### Test Verification\n{verification}\n\n### Impact\n{impact}")
         follow_up_md = ("\n\n5. Follow-up candidates (same smells elsewhere):\n"
                         + "\n".join(f"   - `{p}`" for p in follow_ups[:10])) if follow_ups else ""
         return (
-            f"🎉 Autonomous Modernization Pipeline Completed Successfully!\n\n"
+            f"🎉 Autonomous Modernization Pipeline Completed Successfully!\n{verification}\n\n"
             f"1. Audit Findings & RAG Match:\n{audit_res[:300]}...\n\n"
             f"2. Transformations Applied ({engine_note}):\n{changes}\n\n"
             f"3. Verification (`{command}`):\n{test_res}\n\n"
@@ -1155,10 +1245,20 @@ def format_modernization_report(
         ctx, _reason = _codebase_context(file_path)
         command = test_command.strip() or _default_test_command(ctx, file_path)
         exit_code, test_res = _execute_test_command(command)
+        count = _test_count(test_res)
+        if exit_code != 0:
+            verification = f"Verification: FAILED (`{command}` exit code {exit_code})"
+        elif count == 0:
+            verification = f"Verification: NONE (`{command}` executed 0 tests)"
+        elif count is None:
+            verification = f"Verification: `{command}` exited 0 (test count not reported)"
+        else:
+            verification = f"Verification: {count} test(s) executed and passed (`{command}`)"
         mod_details = (f"Rule-engine / LLM modernization of `{file_path}`. "
                        f"Verification `{command}` exit code: {exit_code}.")
 
         report_md = ModernizationReporter.generate_report(
+            verification=verification,
             file_path=file_path,
             audit_summary=audit_res,
             modernization_details=mod_details,
@@ -1717,6 +1817,27 @@ def modernization_workflow(file_path: str = "") -> str:
     )
 
 
+def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
+    """Serve the MCP tools over stdio (launched by an MCP client) or local HTTP."""
+    if transport == "http":
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            print(f"WARNING: serving on {host} without authentication; anyone who can reach it can read "
+                  f"and modify {WORKSPACE_ROOT}.", file=sys.stderr)
+        # Without authentication, the Host/Origin check is what stops a web page in the user's
+        # browser from reaching a local server (DNS rebinding). FastMCP leaves it off by default.
+        import inspect
+        guard = {"host_origin_protection": "auto"} \
+            if "host_origin_protection" in inspect.signature(mcp.run_http_async).parameters else {}
+        if not guard:
+            print("WARNING: this FastMCP version cannot validate Host/Origin headers; a web page open in your "
+                  "browser may be able to reach this server. Upgrade fastmcp or use the stdio transport.",
+                  file=sys.stderr)
+        mcp.run(transport="http", host=host, port=port, show_banner=False, log_level="CRITICAL", **guard)
+    else:
+        mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
+
+
+
 def main(argv: list[str] | None = None) -> None:
     """Console entry point: `novuspipeline [--workspace DIR] [--transport stdio|http]`."""
     import argparse
@@ -1738,22 +1859,7 @@ def main(argv: list[str] | None = None) -> None:
     if not os.path.isdir(WORKSPACE_ROOT):
         parser.error(f"workspace '{WORKSPACE_ROOT}' is not a directory")
 
-    if args.transport == "http":
-        if args.host not in ("127.0.0.1", "localhost", "::1"):
-            print(f"WARNING: serving on {args.host} without authentication; anyone who can reach it can read "
-                  f"and modify {WORKSPACE_ROOT}.", file=sys.stderr)
-        # Without authentication, the Host/Origin check is what stops a web page in the user's
-        # browser from reaching a local server (DNS rebinding). FastMCP leaves it off by default.
-        import inspect
-        guard = {"host_origin_protection": "auto"} \
-            if "host_origin_protection" in inspect.signature(mcp.run_http_async).parameters else {}
-        if not guard:
-            print("WARNING: this FastMCP version cannot validate Host/Origin headers; a web page open in your "
-                  "browser may be able to reach this server. Upgrade fastmcp or use the stdio transport.",
-                  file=sys.stderr)
-        mcp.run(transport="http", host=args.host, port=args.port, show_banner=False, log_level="CRITICAL", **guard)
-    else:
-        mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
+    run_server(args.transport, args.host, args.port)
 
 
 if __name__ == "__main__":
