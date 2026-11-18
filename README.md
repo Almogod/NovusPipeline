@@ -1,15 +1,35 @@
-# NovusPipeline
+<div align="center">
 
-[![PyPI](https://img.shields.io/pypi/v/novuspipeline)](https://pypi.org/project/novuspipeline/)
-[![Python](https://img.shields.io/pypi/pyversions/novuspipeline)](https://pypi.org/project/novuspipeline/)
+# 🛠️ NovusPipeline
+
+**Modernize legacy Python codebases safely, through your AI assistant.**
+
+An MCP server that audits, rewrites, tests and commits, on a branch, and only if your tests pass.
+
+[![PyPI](https://img.shields.io/pypi/v/novuspipeline?color=3775A9&logo=pypi&logoColor=white)](https://pypi.org/project/novuspipeline/)
+[![Python](https://img.shields.io/pypi/pyversions/novuspipeline?logo=python&logoColor=white)](https://pypi.org/project/novuspipeline/)
 [![CI](https://github.com/Almogod/NovusPipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Almogod/NovusPipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+[Install](#install) · [Connect](#connect-your-mcp-client) · [Standards](#your-standards-industry-team-or-personal-rules) · [What it finds](#what-it-finds) · [Tools](#tools) · [Sandbox](#sandbox)
+
+</div>
+
 <!-- mcp-name: io.github.almogod/novuspipeline -->
 
-An MCP server that modernizes legacy Python codebases safely. It finds legacy code smells (built-in rules, [Ruff](https://docs.astral.sh/ruff/), a graph neural network over the AST, codebase-wide analysis, and smells it learns from your own git history), knows the codebase around each file (who imports it, which of its symbols they use, which tests cover it), applies behavior-preserving rewrites, verifies them with your own tests in a sandbox, and commits only the files it changed, on a branch. Everything runs locally: your code never leaves your machine.
+## ✨ Overview
 
-## Install
+NovusPipeline finds legacy code smells (built-in rules, [Ruff](https://docs.astral.sh/ruff/), a graph neural network over the AST, codebase-wide analysis, and smells it learns from your own git history), knows the codebase around each file (who imports it, which of its symbols they use, which tests cover it), applies behavior-preserving rewrites, verifies them with your own tests in a sandbox, and commits only the files it changed, on a branch.
+
+| | |
+|---|---|
+| 🔍 **Context-aware** | Import graph, dependents, used symbols and related tests for every file |
+| 🧪 **Test-gated** | A change that fails your tests, or removes a symbol others import, is rejected |
+| 🌿 **Non-invasive** | Works in a disposable git worktree and commits only the changed file to a branch |
+| 📐 **Your rules** | Industry, team or personal standards as TOML rule packs, with `block` enforcement |
+| 🔒 **Local** | Everything runs on your machine: your code never leaves it |
+
+## 📦 Install
 
 Requires Python 3.11+. The server runs on your machine and is launched by your MCP client.
 
@@ -21,7 +41,7 @@ Requires Python 3.11+. The server runs on your machine and is launched by your M
 
 On Linux, install CPU torch first to avoid a multi-GB CUDA download: `pip install torch --index-url https://download.pytorch.org/whl/cpu`.
 
-## Connect your MCP client
+## 🔌 Connect your MCP client
 
 Claude Desktop (`claude_desktop_config.json`), Cursor (`.cursor/mcp.json`) and similar clients:
 
@@ -40,7 +60,7 @@ Claude Code: `claude mcp add novuspipeline -- uvx --from "novuspipeline[gnn]" no
 
 Then ask your agent to use the `modernization_workflow` prompt, or call `get_codebase_overview` to start.
 
-## Settings
+## ⚙️ Settings
 
 | Option | Purpose |
 |---|---|
@@ -137,7 +157,7 @@ You can also do all of this through your assistant:
 
 **Guidelines only.** To add reference material without detection (a style guide, an industry regulation summary), use `ingest_rag_document` with any category, e.g. `fintech` or `healthcare`. Ingesting an existing id, including a built-in one such as `py-002`, replaces it; `remove_rag_document` deletes one.
 
-## What it finds
+## 🔎 What it finds
 
 | Source | Examples |
 |---|---|
@@ -157,7 +177,7 @@ Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`
 
 **Learned smells.** `learn_from_history` (also run in the background after indexing) compares each changed function before and after every commit. A replacement such as `client.fetch_json(...)` → `client.get_json(...)` becomes a rule when it shows up in at least 3 separate commits, when the team usually chose that replacement for the old call, and when nobody kept writing the old call after the last replacement (this filters out churn of everyday calls). Remaining uses are reported in audits, file context and the overview. Pure renames with consistent history are applied automatically by the pipeline, and like every other change they must pass your tests first. In a time-split check on Inkscape's extensions repository, both auto-fixable rules learned from the history before mid-2019 were later fully applied by its developers, and 4 of the 5 rules with remaining uses were later acted on.
 
-## Tools
+## 🧰 Tools
 
 | Area | Tools |
 |---|---|
@@ -171,7 +191,7 @@ Dynamic imports are part of the import graph: `importlib.import_module("pkg.x")`
 
 `run_autonomous_modernization_pipeline` never touches your working copy. It modernizes the file in a disposable git worktree, runs the tests that import the file in the sandbox, rejects the change if the tests fail or if a symbol other modules import would disappear, and commits only that file to a branch (`branch_name`, default `auto-modernization-branch`; repeated calls add commits to it). It refuses to run on a file with uncommitted changes, or with your checked-out branch as the target. A PR description draft is written to `.novus_index/prs/`.
 
-### Sandbox
+### 🛡️ Sandbox
 
 Test commands must be test runners (`python -m pytest|unittest`, `pytest`, `npm test`, `npm run test[:x]`, `node --test`, `npx jest|vitest|mocha`, `cargo test`, `go test`, `mvn test`, `gradle test`), and they never run in your working tree. Paths in a test command must be relative to the project (no absolute paths, `~` or `..`), and options that start another program (`go test -exec`, `npm --script-shell`, Maven plugin goals) are refused:
 
@@ -187,7 +207,7 @@ Every test result says which protections were active. Without Docker the sandbox
 
 The file tools do not read or write anything under `.git`, and the HTTP transport rejects requests whose `Host` or `Origin` header is not local, so a web page in your browser cannot drive the server.
 
-### Approve once
+### ✅ Approve once
 
 Tools carry MCP annotations (read-only, destructive, idempotent). Apart from the six destructive tools, every tool only reads, or writes only to `.novus_index/`, a sandbox, or a branch other than the one you have checked out, so you can approve them once (`add_modernization_rule` and `install_standard_pack` also write rule files under `.novus/standards/`). In Claude Code (`.claude/settings.json`), this keeps asking only for the tools that change your working copy, your checked-out branch, or delete guidelines or rules:
 
@@ -209,10 +229,10 @@ Tools carry MCP annotations (read-only, destructive, idempotent). Apart from the
 
 Other clients have an equivalent "always allow" option per tool.
 
-## Development
+## 👩‍💻 Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, checks and design rules, [docs/architecture.md](docs/architecture.md) for how the pieces fit together, and [docs/design-history.md](docs/design-history.md) for design decisions and evaluation results. Report vulnerabilities as described in [SECURITY.md](SECURITY.md); changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
-## License
+## 📄 License
 
 MIT, see [LICENSE](LICENSE).
