@@ -46,8 +46,11 @@ def _server_parent(suppress: bool) -> argparse.ArgumentParser:
     parent.add_argument("--transport", choices=["stdio", "http"], default=default("stdio"),
                         help="stdio for MCP clients that launch the server (default); http to serve locally")
     parent.add_argument("--host", default=default("127.0.0.1"),
-                        help="http only; the server has no authentication, so keep it local")
+                        help="http only; any address but loopback needs authentication (docs/enterprise.md)")
     parent.add_argument("--port", type=int, default=default(8000), help="http only")
+    parent.add_argument("--allow-unauthenticated", action="store_true", default=default(False),
+                        help="http only: serve a non-loopback address without authentication "
+                             "(only behind a gateway that authenticates)")
     return parent
 
 
@@ -143,6 +146,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("status", "GNN checkpoint and local LLM status")
     p.add_argument("--probe", action="store_true", help="load the LLM to report device and VRAM (slow)")
+
+    sub.add_parser("policy", help="show the effective organization policy, authentication and audit settings",
+                   description="Show the effective organization policy, authentication and audit settings.")
+
+    p = sub.add_parser("token", help="create API tokens for the HTTP transport",
+                       description="Create API tokens for the HTTP transport (NOVUS_AUTH_TOKENS_FILE).")
+    tsub = p.add_subparsers(dest="token_command", metavar="<action>", required=True)
+    q = tsub.add_parser("create", help="generate a token and the entry to add to the tokens file")
+    q.add_argument("--name", required=True, help="who or what uses the token (recorded in the audit log)")
+    q.add_argument("--role", choices=["viewer", "developer", "admin"], default="developer",
+                   help="viewer: read-only tools; developer: + branch commits and test runs (default); "
+                        "admin: + destructive tools")
+    q.add_argument("--expires", default="", metavar="YYYY-MM-DD", help="last day the token is valid")
+    q.add_argument("--append", default="", metavar="FILE", help="append the entry to this tokens file")
+
+    p = sub.add_parser("audit-log", help="check the audit log's hash chain",
+                       description="Check that no audit record was edited, removed or inserted.")
+    asub = p.add_subparsers(dest="audit_command", metavar="<action>", required=True)
+    q = asub.add_parser("verify", help="verify the hash chain")
+    q.add_argument("path", nargs="?", default="", help="log file (default: the configured audit log)")
     return parser
 
 
@@ -235,9 +258,85 @@ def _in_terminal() -> bool:
     return bool(sys.stdin and sys.stdin.isatty() and sys.stdout and sys.stdout.isatty())
 
 
+def _token_create(args: argparse.Namespace) -> int:
+    import datetime
+
+    from . import auth
+    if args.expires:
+        try:
+            datetime.date.fromisoformat(args.expires)
+        except ValueError:
+            print("Error: --expires must be a date, e.g. 2027-06-30", file=sys.stderr)
+            return 2
+    token = auth.new_token()
+    entry = auth.token_entry_toml(args.name, token, args.role, args.expires)
+    if args.append:
+        path = os.path.abspath(os.path.expanduser(args.append))
+        new = not os.path.exists(path)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(("" if new else "\n") + entry + "\n")
+        print(f"Added `{args.name}` ({args.role}) to {path}. The server picks it up on restart.", file=sys.stderr)
+    else:
+        print("Add this entry to the file NOVUS_AUTH_TOKENS_FILE points to:\n", file=sys.stderr)
+        print(entry)
+    print(f"\nToken for `{args.name}` (shown once; only its hash is stored):\n  {token}\n"
+          f"Clients send it as `Authorization: Bearer <token>`.", file=sys.stderr)
+    return 0
+
+
+def _policy_report() -> int:
+    from . import audit, auth, policy
+    lines, failed = [], False
+    try:
+        lines.append(policy.current().describe())
+    except policy.PolicyError as e:
+        lines.append(f"Error: {e}\n  Every tool refuses to run until the policy file is fixed.")
+        failed = True
+    lines.append(f"  (system policy location: {policy.system_policy_path()})")
+    try:
+        _, methods = auth.build_verifier()
+        lines.append("HTTP authentication: " + ("; ".join(methods) if methods else
+                                                "none (only loopback addresses can be served)"))
+    except auth.AuthConfigError as e:
+        lines.append(f"HTTP authentication: Error: {e}")
+        failed = True
+    if not failed:
+        log = audit.log_path()
+        problem = audit.check_writable(log) if log else None
+        lines.append(f"Audit log: {log}" + (f" ({problem})" if problem else "") if log else
+                     f"Audit log: off (set {audit.ENV_AUDIT_LOG} or the policy's audit_log)")
+        failed = bool(problem)
+    print("\n".join(lines))
+    return 1 if failed else 0
+
+
+def _audit_verify(path: str) -> int:
+    from . import audit, policy
+    if not path:
+        try:
+            path = audit.log_path()
+        except policy.PolicyError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        if not path:
+            print(f"Error: no audit log configured; pass a path or set {audit.ENV_AUDIT_LOG}.", file=sys.stderr)
+            return 1
+    ok, message = audit.verify(path)
+    print(f"{path}: {message}")
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Administration commands: no workspace, no ML stack.
+    if args.command == "token":
+        return _token_create(args)
+    if args.command == "policy":
+        return _policy_report()
+    if args.command == "audit-log":
+        return _audit_verify(args.path)
     guided = args.command == "start" or (args.command is None and args.transport == "stdio" and _in_terminal())
 
     from . import server  # heavy: FastMCP, ChromaDB
@@ -257,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     _set_workspace(server, args.workspace, parser)
 
     if args.command in (None, "serve"):
-        server.run_server(args.transport, args.host, args.port)
+        server.run_server(args.transport, args.host, args.port, args.allow_unauthenticated)
         return 0
 
     _use_utf8_output()

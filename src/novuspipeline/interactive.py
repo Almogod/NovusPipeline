@@ -129,6 +129,17 @@ def _run(out: _Out, srv, path, interactive, branch, test_command, use_llm, merge
          allow_untested) -> int:
     out.line(out.bold(out.cyan(f"NovusPipeline {__version__}")) + out.dim("  modernize legacy code, test-gated"))
     out.line()
+    from . import policy
+    active, problem = policy.current_or_none()
+    if active is None:
+        out.line(out.red(f"Error: {problem}"))
+        return 2
+    denial = active.tool_denial("run_autonomous_modernization_pipeline", "write")
+    if denial or (allow_untested and not active.allow_untested) or (use_llm and not active.allow_llm):
+        out.line(out.red("Error: " + (denial or "organization policy does not allow "
+                                      + ("--allow-untested" if allow_untested and not active.allow_untested
+                                         else "--llm") + ".")))
+        return 2
 
     if path is None:
         if not interactive:

@@ -40,10 +40,25 @@ permissions. Its protections, and their limits:
 - **Git**: the autonomous pipeline never modifies the working copy or the
   checked-out branch and never pushes. Tools that do change the working copy
   are annotated as destructive so clients ask before running them.
-- **HTTP transport** has no authentication. Keep it on `127.0.0.1` (the default);
-  the server warns when bound to another address. On a loopback address it
-  validates `Host` and `Origin` headers, which stops DNS-rebinding requests from
-  a web page; bound to any other address it does not.
+- **HTTP transport** authenticates callers with hashed API tokens or OIDC
+  (`NOVUS_AUTH_TOKENS_FILE`, `NOVUS_AUTH_TOKEN`, `NOVUS_OIDC_*`) and limits each
+  to its role (`viewer`, `developer`, `admin`, following the tools' MCP
+  annotations). Without authentication it only serves loopback addresses, where
+  it validates `Host` and `Origin` headers against DNS rebinding; any other
+  address is refused unless `--allow-unauthenticated` is passed for a gateway
+  that authenticates. It speaks plain HTTP: terminate TLS in front of it.
+- **Organization policy** (`policy.toml` in the site config directory) binds
+  this installation: it cannot be loosened by projects, user settings or
+  environment variables, and an invalid policy makes every tool refuse to run.
+  It is not a boundary against a user with shell access who installs another
+  copy.
+- **Audit log**: when configured, every tool call (including refused ones) is
+  appended as a hash-chained JSON line; `novuspipeline audit-log verify` detects
+  edited, removed or inserted records. Ship the log off the host to protect it
+  against wholesale deletion.
 - **Models**: the GNN checkpoint ships in the package. The optional LLM is
-  downloaded from Hugging Face on first use unless `NOVUS_LLM_OFFLINE=1`; no
-  code is sent to any service.
+  downloaded from Hugging Face on first use unless `NOVUS_LLM_OFFLINE=1` (or the
+  policy's `llm_offline`); no code is sent to any service, and ChromaDB telemetry
+  is disabled.
+
+Deployment guidance for organizations is in [docs/enterprise.md](docs/enterprise.md).

@@ -70,7 +70,7 @@ class TestEntryPoint(unittest.TestCase):
                 mock.patch.object(server, "run_server") as serve, \
                 mock.patch.object(server, "WORKSPACE_ROOT", os.getcwd()):
             cli.main(["--workspace", os.getcwd()])
-        serve.assert_called_once_with("stdio", "127.0.0.1", 8000)
+        serve.assert_called_once_with("stdio", "127.0.0.1", 8000, False)
         run.assert_not_called()
 
     def test_http_transport_always_serves(self):

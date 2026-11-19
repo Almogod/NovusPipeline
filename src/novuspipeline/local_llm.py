@@ -97,6 +97,9 @@ class LLMWorker:
         if python is None:
             raise RuntimeError('No LLM interpreter: pip install "novuspipeline[llm]" or set NOVUS_LLM_PYTHON.')
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+        from . import policy
+        if policy.current().llm_offline:  # organization policy: never download models
+            env.update(NOVUS_LLM_OFFLINE="1", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
         os.makedirs(os.path.dirname(worker_log()), exist_ok=True)
         with open(worker_log(), "a", encoding="utf-8") as log:
             self._proc = subprocess.Popen([python, "-u", WORKER_SCRIPT], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -291,6 +294,9 @@ def propose_modernization(legacy_code: str, rag_guidelines: str, codebase_contex
 
     if os.environ.get("NOVUS_FAST_TEST") == "1":
         return rule_based("NOVUS_FAST_TEST=1")
+    from . import policy
+    if not policy.current().allow_llm:
+        return rule_based("LLM disabled by organization policy")
     try:
         resp = _WORKER.request("generate", GENERATE_TIMEOUT_SECONDS + LOAD_TIMEOUT_SECONDS,
                                messages=generate_modernization_messages(legacy_code, rag_guidelines, codebase_context),

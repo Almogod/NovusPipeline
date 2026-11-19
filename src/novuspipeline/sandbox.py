@@ -315,6 +315,12 @@ def run(args: list[str], workspace: str, timeout: int, copy: bool = True) -> San
             isolation.append("disposable checkout")
 
         mode = os.environ.get("NOVUS_SANDBOX", "auto").lower()
+        from . import policy
+        if policy.current().require_docker_sandbox:
+            if not docker_available():
+                return SandboxResult(None, "Error: organization policy requires the Docker sandbox "
+                                     "(require_docker_sandbox), but Docker is not available.", [*isolation, "none: refused"])
+            mode = "docker"
         if mode == "docker" or (mode == "auto" and os.environ.get("NOVUS_SANDBOX_IMAGE") and docker_available()):
             image = os.environ.get("NOVUS_SANDBOX_IMAGE", f"python:{sys.version_info.major}.{sys.version_info.minor}-slim")
             result = _run_docker(args, workdir, timeout, image)

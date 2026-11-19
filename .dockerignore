@@ -1,0 +1,8 @@
+# The image is built from the package sources only.
+*
+!pyproject.toml
+!README.md
+!LICENSE
+!src/
+**/__pycache__
+**/*.pyc

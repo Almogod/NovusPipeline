@@ -115,7 +115,12 @@ def initialize_repo(root: str) -> str:
 
 
 def default_branch_name() -> str:
-    return time.strftime("novus/modernize-%Y%m%d-%H%M%S")
+    name = time.strftime("novus/modernize-%Y%m%d-%H%M%S")
+    from . import policy
+    active, _ = policy.current_or_none()
+    if active is not None and active.branch_denial(name):
+        name = active.branch_prefix + name.removeprefix("novus/")
+    return name
 
 
 def workspace_files(root: str, include_tests: bool = False) -> list[str]:

@@ -6,6 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added (organizations)
+- **Organization policy** (`policy.toml` in the site config directory, plus `NOVUS_POLICY_FILE`; most
+  restrictive wins): `disabled_tools`, `allow_destructive_tools`, `allow_untested`, `allow_llm`, `llm_offline`,
+  `require_docker_sandbox`, `required_packs` (loaded last, so projects cannot override or weaken their rules),
+  `branch_prefix`, `audit_log` and `require_auth`. Enforced for MCP calls, terminal commands and guided mode.
+  An invalid policy fails closed. `novuspipeline policy` shows the effective settings.
+- **HTTP authentication and roles**: hashed API tokens with expiry (`NOVUS_AUTH_TOKENS_FILE`,
+  `novuspipeline token create`), a shared token (`NOVUS_AUTH_TOKEN`), and OIDC/JWT (`NOVUS_OIDC_JWKS_URI`,
+  `NOVUS_OIDC_ISSUER`, `NOVUS_OIDC_AUDIENCE`). Roles `viewer`/`developer`/`admin` (scopes `novus:read`,
+  `novus:write`, `novus:admin`) follow the tools' annotations; `tools/list` only shows what the caller may call.
+- **Audit log** (`NOVUS_AUDIT_LOG` or the policy's `audit_log`): a hash-chained JSON line per tool call with
+  caller, transport, arguments (long values hashed), outcome and duration, including refused calls; safe for
+  several processes; `novuspipeline audit-log verify` checks the chain.
+- `GET /healthz` for load balancers and orchestrators; `NOVUS_LOG_LEVEL` and `NOVUS_LOG_FORMAT=json`.
+- Container image (`Dockerfile`: non-root, health check, JSON logs), published to GHCR on release.
+- Releases carry a CycloneDX SBOM and signed build provenance; CI runs CodeQL, `pip-audit` and a container
+  smoke test. `docs/enterprise.md` is the deployment guide.
+
+### Changed (organizations)
+- **The HTTP transport refuses to serve a non-loopback address without authentication** (it used to warn).
+  Configure authentication, or pass `--allow-unauthenticated` when a gateway in front authenticates.
+- ChromaDB anonymized telemetry is explicitly disabled.
+
 ### Changed
 - **A run where zero tests executed is no longer a pass.** `run_autonomous_modernization_pipeline` used to
   commit when a project without tests exited 0. It now refuses, unless `allow_untested=true`, and even then

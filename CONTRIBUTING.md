@@ -40,6 +40,9 @@ changes that weaken them need a design discussion first.
   log to stderr.
 - **Honest output**: tools report what was actually done and which protections
   were active; failures raise MCP errors instead of returning success text.
+- **Governed entry points**: register every tool with `_tool(kind)` and choose the
+  kind honestly (`read`, `write`, `destructive`); roles, policy and the audit log
+  all depend on it. New policy settings must fail closed and can only restrict.
 
 ## GNN and LLM
 

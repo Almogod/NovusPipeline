@@ -11,7 +11,7 @@ An MCP server that audits, rewrites, tests and commits, on a branch, and only if
 [![CI](https://github.com/Almogod/NovusPipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/Almogod/NovusPipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Install](#install) · [Connect](#connect-your-mcp-client) · [Standards](#your-standards-industry-team-or-personal-rules) · [What it finds](#what-it-finds) · [Tools](#tools) · [Sandbox](#sandbox)
+[Install](#install) · [Connect](#connect-your-mcp-client) · [Standards](#your-standards-industry-team-or-personal-rules) · [What it finds](#what-it-finds) · [Tools](#tools) · [Sandbox](#sandbox) · [Organizations](#-for-organizations)
 
 </div>
 
@@ -28,6 +28,7 @@ NovusPipeline finds legacy code smells (built-in rules, [Ruff](https://docs.astr
 | 🌿 **Non-invasive** | Works in a disposable git worktree and commits only the changed file to a branch |
 | 📐 **Your rules** | Industry, team or personal standards as TOML rule packs, with `block` enforcement |
 | 🔒 **Local** | Everything runs on your machine: your code never leaves it |
+| 🏢 **Governed** | Org-wide policy, SSO/token auth with roles, and a tamper-evident audit log ([details](docs/enterprise.md)) |
 
 ## 📦 Install
 
@@ -114,7 +115,11 @@ Also: `index`, `gnn`, `similar`, `history`, `guidelines search|show|stats`, `sta
 | Option | Purpose |
 |---|---|
 | `--workspace DIR` / `NOVUS_WORKSPACE_ROOT` | The codebase to modernize (default: current directory) |
-| `--transport http --port 8000` | Serve over HTTP instead of stdio. No authentication: keep it on `127.0.0.1` |
+| `--transport http --port 8000` | Serve over HTTP instead of stdio. Any address but `127.0.0.1` needs authentication ([enterprise guide](docs/enterprise.md)) |
+| `NOVUS_AUTH_TOKENS_FILE`, `NOVUS_AUTH_TOKEN`, `NOVUS_OIDC_*` | HTTP authentication: hashed API tokens with roles, one shared token, or your identity provider |
+| `NOVUS_POLICY_FILE` | Additional organization policy (the system-wide one is in the site config directory) |
+| `NOVUS_AUDIT_LOG` | Append a hash-chained JSON line per tool call to this file |
+| `NOVUS_LOG_LEVEL`, `NOVUS_LOG_FORMAT=json` | Server logs on stderr (default `CRITICAL`, plain text) |
 | `NOVUS_PYTHON` | Interpreter for running your tests (default: the workspace's `.venv`/`venv`, else the server's) |
 | `NOVUS_DATA_DIR` | Where the guideline database lives (default: your user data directory) |
 | `NOVUS_GNN_DIR` | Use a retrained GNN checkpoint instead of the bundled one |
@@ -255,7 +260,7 @@ Test commands must be test runners (`python -m pytest|unittest`, `pytest`, `npm 
 
 Every test result says which protections were active. Without Docker the sandbox is not a VM: tests still run as your user and can read files outside the project by absolute path; on Linux and macOS they can also write to them, and on Windows and macOS they have network access. Use `NOVUS_SANDBOX=docker` for code you don't trust.
 
-The file tools do not read or write anything under `.git`, and the HTTP transport rejects requests whose `Host` or `Origin` header is not local, so a web page in your browser cannot drive the server.
+The file tools do not read or write anything under `.git`, and the HTTP transport rejects requests whose `Host` or `Origin` header is not local, so a web page in your browser cannot drive the server. Serving any other address requires authentication (see [For organizations](#-for-organizations)).
 
 ### ✅ Approve once
 
@@ -278,6 +283,18 @@ Tools carry MCP annotations (read-only, destructive, idempotent). Apart from the
 ```
 
 Other clients have an equivalent "always allow" option per tool.
+
+## 🏢 For organizations
+
+NovusPipeline can be rolled out to many developers or run as a shared service. The
+[enterprise guide](docs/enterprise.md) covers it:
+
+- **Organization policy**: a system-wide `policy.toml` that projects and users cannot loosen. Use it to disable tools, forbid untested commits or the LLM, require the Docker sandbox, enforce rule packs projects cannot override, restrict which branches get commits, and force an audit log. An invalid policy fails closed.
+- **Authentication and roles** over HTTP: hashed API tokens (`novuspipeline token create`) or OIDC/SSO, with `viewer`, `developer` and `admin` roles mapped onto the tools' annotations. The server refuses to serve a non-loopback address without authentication.
+- **Audit log**: one JSON line per tool call from any surface, with the caller, arguments (long values hashed), outcome and duration, hash-chained (`novuspipeline audit-log verify`).
+- **Operations**: a container image (non-root, `/healthz`, JSON logs), no network egress in the core install, air-gapped installs, and releases with an SBOM and signed provenance.
+
+`novuspipeline policy` shows the effective policy, authentication and audit settings.
 
 ## 👩‍💻 Development
 

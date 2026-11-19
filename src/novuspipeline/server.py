@@ -1,21 +1,42 @@
+import json
 import logging
 import os
 import shutil
 import sys
+import time
 
-# Ensure all logging is routed strictly to stderr at CRITICAL level BEFORE importing fastmcp
-logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
+
+class _JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(record.created)) + f".{int(record.msecs):03d}Z",
+                 "level": record.levelname, "logger": record.name, "message": record.getMessage()}
+        if record.exc_info:
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry, ensure_ascii=False)
+
+
+# All logging goes to stderr BEFORE fastmcp is imported: under stdio, stdout is the JSON-RPC
+# channel. NOVUS_LOG_LEVEL (default CRITICAL) and NOVUS_LOG_FORMAT=json for log collectors.
+_LOG_LEVEL = os.environ.get("NOVUS_LOG_LEVEL", "CRITICAL").strip().upper() or "CRITICAL"
+if _LOG_LEVEL not in logging.getLevelNamesMapping():
+    _LOG_LEVEL = "CRITICAL"
+logging.basicConfig(level=_LOG_LEVEL, stream=sys.stderr)
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
 stderr_handler = logging.StreamHandler(sys.stderr)
-stderr_handler.setLevel(logging.CRITICAL)
+stderr_handler.setLevel(_LOG_LEVEL)
+if os.environ.get("NOVUS_LOG_FORMAT", "").strip().lower() == "json":
+    stderr_handler.setFormatter(_JsonLogFormatter())
 logging.root.addHandler(stderr_handler)
+logging.root.setLevel(_LOG_LEVEL)
 
 os.environ["FASTMCP_SHOW_SERVER_BANNER"] = "0"
-os.environ["FASTMCP_LOG_LEVEL"] = "CRITICAL"
+os.environ["FASTMCP_LOG_LEVEL"] = _LOG_LEVEL
 
 import contextlib
+import contextvars
 import functools
+import inspect
 import re
 import shlex
 import subprocess
@@ -24,9 +45,21 @@ from collections import Counter
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import Middleware
 from mcp.types import ToolAnnotations
 
-from . import codebase_context, gnn_model, history_learner, local_llm, ruff_backend, sandbox, standards
+from . import (
+    audit,
+    auth,
+    codebase_context,
+    gnn_model,
+    history_learner,
+    local_llm,
+    policy,
+    ruff_backend,
+    sandbox,
+    standards,
+)
 from .ingest_rag import CHROMA_DIR, COLLECTION_NAME, ensure_seeded, get_collection
 from .ingest_rag import similarity_from_distance as ingest_rag_similarity
 from .modernizer import CodeModernizer, LegacySmellDetector, missing_names
@@ -48,28 +81,146 @@ _TOOL_KINDS = {
 }
 
 
+# Tool name -> annotation kind, for authorization and policy checks.
+TOOL_KINDS: dict[str, str] = {}
+# True while a tool runs: tools calling each other are one audited, policy-checked call.
+_IN_TOOL: contextvars.ContextVar[bool] = contextvars.ContextVar("novus_in_tool", default=False)
+
+
+def _governed(fn, kind: str):
+    """
+    `fn` with organization policy and auditing applied to the outermost call, whichever
+    surface it came from (MCP, terminal command, guided mode). Nested tool calls pass through.
+    """
+    name = fn.__name__
+    signature = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def governed(*args, **kwargs):
+        if _IN_TOOL.get():
+            return fn(*args, **kwargs)
+        try:
+            bound = signature.bind_partial(*args, **kwargs).arguments
+        except TypeError:
+            bound = {"args": list(args), **kwargs}
+        active, problem = policy.current_or_none()
+        denial = (problem and f"refused: {problem}") or (active.tool_denial(name, kind) if active else None)
+        if denial:
+            if active is not None:
+                audit.record(name, kind, bound, "denied", workspace=WORKSPACE_ROOT, detail=denial)
+            return f"Error: {denial}"
+        token = _IN_TOOL.set(True)
+        start = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as e:
+            audit.record(name, kind, bound, "error", workspace=WORKSPACE_ROOT, detail=f"{type(e).__name__}: {e}",
+                         duration_ms=int((time.perf_counter() - start) * 1000))
+            raise
+        finally:
+            _IN_TOOL.reset(token)
+        audit.record(name, kind, bound, audit.outcome_of(result), workspace=WORKSPACE_ROOT,
+                     result=result if isinstance(result, str) else "",
+                     duration_ms=int((time.perf_counter() - start) * 1000))
+        return result
+    return governed
+
+
 def _tool(kind: str, timeout: float = 900.0):
     """
     Registers a tool with MCP annotations, a timeout, and thread execution. Results starting
-    with "Error" are raised as ToolError so clients see isError=True. The undecorated function
-    is returned unchanged, so tools can call each other and tests can call them directly.
+    with "Error" are raised as ToolError so clients see isError=True. The returned function is
+    the tool with policy and auditing applied (see `_governed`) and is otherwise the plain
+    function, so tools can call each other and tests can call them directly.
     """
     def register(fn):
+        TOOL_KINDS[fn.__name__] = kind
+        governed = _governed(fn, kind)
+
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             if kind == "read":
-                result = fn(*args, **kwargs)
+                result = governed(*args, **kwargs)
             else:
                 with _WORKSPACE_LOCK:
-                    result = fn(*args, **kwargs)
+                    result = governed(*args, **kwargs)
             if isinstance(result, str) and result.startswith("Error"):
                 raise ToolError(result)
             return result
 
         mcp.tool(wrapper, name=fn.__name__, timeout=timeout, run_in_thread=True,
                  annotations=ToolAnnotations(open_world_hint=False, **_TOOL_KINDS[kind]))
-        return fn
+        return governed
     return register
+
+
+class AccessControlMiddleware(Middleware):
+    """
+    Over authenticated HTTP: hides and refuses tools the caller's role does not cover, and
+    tags each call with the caller's identity for the audit log. Tools disabled by
+    organization policy are hidden from every caller.
+    """
+
+    def __init__(self) -> None:
+        self.enabled = False  # set by run_server when a token verifier is configured
+
+    def _caller(self) -> "audit.Caller | None":
+        if not self.enabled:
+            return None
+        from fastmcp.server.dependencies import get_access_token
+        token = get_access_token()
+        return auth.caller_from_token(token) if token is not None else audit.Caller("anonymous", "none")
+
+    def _visible(self, name: str, caller: "audit.Caller | None") -> bool:
+        kind = TOOL_KINDS.get(name)
+        if kind is None:
+            return True
+        active, _ = policy.current_or_none()
+        if active is not None and active.tool_denial(name, kind):
+            return False
+        return caller is None or auth.allows(caller.scopes, kind)
+
+    async def on_list_tools(self, context, call_next):
+        tools = await call_next(context)
+        caller = self._caller()
+        return [t for t in tools if self._visible(t.name, caller)]
+
+    async def on_call_tool(self, context, call_next):
+        caller = self._caller()
+        name = context.message.name
+        kind = TOOL_KINDS.get(name)
+        if caller is not None and kind is not None and not auth.allows(caller.scopes, kind):
+            needed = auth.REQUIRED_SCOPE[kind]
+            message = f"`{caller.principal}` is not permitted to call `{name}` (needs the {needed} scope)."
+            with contextlib.suppress(Exception):
+                audit.record(name, kind, dict(context.message.arguments or {}), "denied",
+                             workspace=WORKSPACE_ROOT, detail=message, caller=caller)
+            raise ToolError(f"Error: {message}")
+        reset = audit.CALLER.set(caller) if caller is not None else None
+        try:
+            return await call_next(context)
+        finally:
+            if reset is not None:
+                audit.CALLER.reset(reset)
+
+
+_ACCESS = AccessControlMiddleware()
+mcp.add_middleware(_ACCESS)
+
+
+@mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
+async def _healthz(request):
+    """Liveness/readiness for load balancers and orchestrators. Unauthenticated; reveals no paths."""
+    from starlette.responses import JSONResponse
+
+    from . import __version__
+    active, problem = policy.current_or_none()
+    healthy = active is not None and os.path.isdir(WORKSPACE_ROOT)
+    body = {"status": "ok" if healthy else "unavailable", "version": __version__,
+            "auth": _ACCESS.enabled, "policy": bool(active and active.sources)}
+    if problem:
+        body["error"] = "invalid organization policy"
+    return JSONResponse(body, status_code=200 if healthy else 503)
 
 # The codebase being modernized. Defaults to the server's working directory;
 # set NOVUS_WORKSPACE_ROOT to point the server at another project.
@@ -517,6 +668,8 @@ def _execute_test_command(command: str, workspace: str | None = None,
         res = sandbox.run(args, workspace, TEST_TIMEOUT_SECONDS, copy=not disposable)
     except OSError as e:
         return None, f"Error executing test command '{command}': {e}"
+    if res.exit_code is None and not res.timed_out and res.output.startswith("Error"):
+        return None, res.output  # refused before running (e.g. a sandbox the policy requires is unavailable)
     isolation = "Sandbox: " + "; ".join(res.isolation)
     if res.timed_out:
         return None, (f"Error: Command '{command}' timed out after {TEST_TIMEOUT_SECONDS} seconds "
@@ -569,6 +722,9 @@ def create_git_migration_pr(branch_name: str, commit_message: str, pr_title: str
             repo.git.check_ref_format("--branch", branch_name)
         except git.GitCommandError:
             return f"Error: '{branch_name}' is not a valid git branch name."
+        denied = policy.current().branch_denial(branch_name)
+        if denied:
+            return f"Error: '{branch_name}': {denied}"
 
         to_stage: list[str] = []
         for path in files or []:
@@ -694,6 +850,8 @@ def generate_llm_modernization_proposal(file_path: str, rag_query: str = "") -> 
         file_path: Relative or absolute path to legacy source file.
         rag_query: Optional search query to customize RAG guideline retrieval.
     """
+    if not policy.current().allow_llm:
+        return "Error: organization policy does not allow LLM proposals."
     try:
         code = read_legacy_file(file_path)
         if code.startswith("Error:"):
@@ -1084,6 +1242,11 @@ def run_autonomous_modernization_pipeline(
 
     import git
 
+    active = policy.current()
+    if allow_untested and not active.allow_untested:
+        return "Error: organization policy does not allow committing untested files (`allow_untested`)."
+    if use_llm and not active.allow_llm:
+        return "Error: organization policy does not allow LLM proposals (`use_llm`)."
     full_path = _resolve_workspace_path(file_path)
     if not is_path_in_workspace(full_path):
         return f"Error: Path '{file_path}' is outside authorized project workspace."
@@ -1097,6 +1260,9 @@ def run_autonomous_modernization_pipeline(
         repo.git.check_ref_format("--branch", branch_name)
     except git.GitCommandError:
         return f"Error: '{branch_name}' is not a valid git branch name."
+    denied = active.branch_denial(branch_name)
+    if denied:
+        return f"Error: '{branch_name}': {denied}"
     if not repo.head.is_detached and repo.active_branch.name == branch_name:
         return f"Error: '{branch_name}' is your checked-out branch; choose a separate branch for the pipeline."
     rel = os.path.relpath(full_path, repo.working_tree_dir).replace(os.sep, "/")
@@ -1817,24 +1983,78 @@ def modernization_workflow(file_path: str = "") -> str:
     )
 
 
-def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000) -> None:
-    """Serve the MCP tools over stdio (launched by an MCP client) or local HTTP."""
+class StartupError(RuntimeError):
+    """The server must not start with this configuration."""
+
+
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def prepare_server(transport: str = "stdio", host: str = "127.0.0.1", allow_unauthenticated: bool = False) -> list[str]:
+    """
+    Validates the deployment configuration and installs authentication. Returns notes for
+    stderr; raises StartupError instead of starting in an unsafe or unauditable state.
+    """
+    try:
+        active = policy.current()
+        log = audit.log_path()
+    except policy.PolicyError as e:
+        raise StartupError(str(e)) from e
+    notes = []
+    if log:
+        problem = audit.check_writable(log)
+        if problem:
+            raise StartupError(problem)
+        notes.append(f"Audit log: {log}")
+    if active.sources:
+        notes.append(f"Organization policy: {', '.join(active.sources)}")
+    audit.TRANSPORT = f"mcp-{transport}"
+    if transport != "http":
+        return notes
+    try:
+        verifier, methods = auth.build_verifier()
+    except auth.AuthConfigError as e:
+        raise StartupError(str(e)) from e
+    if verifier is None:
+        if active.require_auth:
+            raise StartupError("organization policy requires authentication for the HTTP transport; set "
+                               f"{auth.ENV_TOKENS_FILE}, {auth.ENV_SHARED_TOKEN} or the NOVUS_OIDC_* variables.")
+        if host not in _LOOPBACK:
+            if not allow_unauthenticated:
+                raise StartupError(
+                    f"refusing to serve {WORKSPACE_ROOT} on {host} without authentication: anyone who can reach it "
+                    f"could read and modify it. Configure {auth.ENV_TOKENS_FILE}, {auth.ENV_SHARED_TOKEN} or OIDC "
+                    "(see docs/enterprise.md), or pass --allow-unauthenticated if a gateway in front authenticates.")
+            notes.append(f"WARNING: serving on {host} without authentication (--allow-unauthenticated).")
+    else:
+        mcp.auth = verifier
+        _ACCESS.enabled = True
+        notes.append("Authentication: " + "; ".join(methods))
+    return notes
+
+
+def run_server(transport: str = "stdio", host: str = "127.0.0.1", port: int = 8000,
+               allow_unauthenticated: bool = False) -> None:
+    """Serve the MCP tools over stdio (launched by an MCP client) or HTTP."""
+    try:
+        notes = prepare_server(transport, host, allow_unauthenticated)
+    except StartupError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        raise SystemExit(2) from None
+    for note in notes:
+        print(note, file=sys.stderr)
     if transport == "http":
-        if host not in ("127.0.0.1", "localhost", "::1"):
-            print(f"WARNING: serving on {host} without authentication; anyone who can reach it can read "
-                  f"and modify {WORKSPACE_ROOT}.", file=sys.stderr)
-        # Without authentication, the Host/Origin check is what stops a web page in the user's
-        # browser from reaching a local server (DNS rebinding). FastMCP leaves it off by default.
-        import inspect
+        # The Host/Origin check is what stops a web page in the user's browser from reaching a
+        # local server (DNS rebinding). FastMCP leaves it off by default.
         guard = {"host_origin_protection": "auto"} \
             if "host_origin_protection" in inspect.signature(mcp.run_http_async).parameters else {}
-        if not guard:
+        if not guard and not _ACCESS.enabled:
             print("WARNING: this FastMCP version cannot validate Host/Origin headers; a web page open in your "
                   "browser may be able to reach this server. Upgrade fastmcp or use the stdio transport.",
                   file=sys.stderr)
-        mcp.run(transport="http", host=host, port=port, show_banner=False, log_level="CRITICAL", **guard)
+        mcp.run(transport="http", host=host, port=port, show_banner=False, log_level=_LOG_LEVEL, **guard)
     else:
-        mcp.run(transport="stdio", show_banner=False, log_level="CRITICAL")
+        mcp.run(transport="stdio", show_banner=False, log_level=_LOG_LEVEL)
 
 
 
@@ -1851,6 +2071,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="stdio for MCP clients that launch the server (default); http to serve over the network")
     parser.add_argument("--host", default="127.0.0.1", help="http only; the server has no authentication, so keep it local")
     parser.add_argument("--port", type=int, default=8000, help="http only")
+    parser.add_argument("--allow-unauthenticated", action="store_true",
+                        help="http only: serve a non-loopback address without authentication")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = parser.parse_args(argv)
 
@@ -1859,7 +2081,7 @@ def main(argv: list[str] | None = None) -> None:
     if not os.path.isdir(WORKSPACE_ROOT):
         parser.error(f"workspace '{WORKSPACE_ROOT}' is not a directory")
 
-    run_server(args.transport, args.host, args.port)
+    run_server(args.transport, args.host, args.port, args.allow_unauthenticated)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
-# Publishes to PyPI when a GitHub release is published (tag vX.Y.Z matching __version__).
+# Publishes when a GitHub release is published (tag vX.Y.Z matching __version__):
+#   - the wheel and sdist to PyPI (trusted publishing; PyPI attaches build attestations),
+#   - the wheel, sdist and a CycloneDX SBOM to the GitHub release, with signed build
+#     provenance (verify: `gh attestation verify <file> --repo Almogod/NovusPipeline`),
+#   - the container image to ghcr.io/almogod/novuspipeline, with provenance and SBOM.
 # One-time setup: on pypi.org add a "trusted publisher" for this repository with
-# workflow "publish.yml" and environment "pypi". No API token is stored here;
-# PyPI attaches build attestations automatically.
+# workflow "publish.yml" and environment "pypi". No API token is stored here.
 name: Publish
 
 on:
@@ -29,10 +32,21 @@ jobs:
       - run: pip install build twine
       - run: python -m build
       - run: twine check --strict dist/*
+      - name: SBOM of a core install (CycloneDX)
+        run: |
+          python -m venv /tmp/sbom
+          /tmp/sbom/bin/pip install dist/*.whl
+          pip install cyclonedx-bom   # outside the scanned environment, so it is not in the SBOM
+          cyclonedx-py environment /tmp/sbom/bin/python --output-format JSON \
+            --output-file novuspipeline-${GITHUB_REF_NAME}.cdx.json
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "*.cdx.json"
 
   publish:
     needs: build
@@ -46,3 +60,65 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  release-assets:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: sbom/
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
+      - name: Attach to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" dist/* sbom/* --clobber --repo "${GITHUB_REPOSITORY}"
+
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/almogod/novuspipeline
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/almogod/novuspipeline
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

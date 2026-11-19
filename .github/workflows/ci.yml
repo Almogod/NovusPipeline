@@ -64,3 +64,36 @@ jobs:
         with:
           name: dist
           path: dist/
+
+  dependency-audit:
+    # Known vulnerabilities in the dependencies a core install resolves to (OSV / PyPI advisories).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install pip-audit
+      - run: pip install .
+      - run: pip-audit --skip-editable --progress-spinner off
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t novuspipeline:ci .
+      - name: Refuses to serve without authentication
+        run: |
+          if docker run --rm novuspipeline:ci; then
+            echo "the container started without authentication" >&2; exit 1
+          fi
+      - name: Serves with a token; health check and 401 without it
+        run: |
+          git init -q /tmp/ws
+          token="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          docker run -d --name novus -p 8000:8000 -v /tmp/ws:/workspace -e NOVUS_AUTH_TOKEN="$token" novuspipeline:ci
+          for i in $(seq 60); do curl -fsS http://127.0.0.1:8000/healthz && break; sleep 2; done
+          curl -fsS http://127.0.0.1:8000/healthz | grep -q '"auth":true'
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8000/mcp)" = 401
+      - if: failure()
+        run: docker logs novus || true

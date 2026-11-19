@@ -66,6 +66,13 @@ def baseline_active(workspace: str) -> bool:
     return not any(os.path.isfile(os.path.join(scope_dir(workspace, s), "baseline.toml")) for s in ("user", "project"))
 
 
+def policy_pack_paths() -> list[str]:
+    """Pack files the organization policy requires (built-in names resolved), in policy order."""
+    from . import policy
+    builtin = builtin_packs()
+    return [builtin.get(p, p) for p in policy.current().required_packs]
+
+
 def user_dir() -> str:
     from .ingest_rag import data_dir
     return os.path.join(data_dir(), "standards")
@@ -158,6 +165,13 @@ class Standards:
         for scope in ("user", "project"):
             for path in sorted(glob.glob(os.path.join(scope_dir(workspace, scope), "*.toml"))):
                 self._load_pack(path, scope, by_id)
+        # Packs the organization policy requires load last: user and project packs cannot replace
+        # their rules (same id) or ignore the Ruff codes they block.
+        user_block = len(self.ruff_block)
+        for path in policy_pack_paths():
+            self._load_pack(path, "policy", by_id)
+        enforced = set(self.ruff_block[user_block:])
+        self.ruff_ignore = [c for c in self.ruff_ignore if c not in enforced]
         self.rules = list(by_id.values())
         self._embeddings: list[list[float]] | None = None
 
@@ -445,10 +459,12 @@ _CACHE_LOCK = threading.Lock()
 
 def signature(workspace: str) -> str:
     parts = [f"baseline:{baseline_active(workspace)}"]
-    for scope in ("user", "project"):
-        for path in sorted(glob.glob(os.path.join(scope_dir(workspace, scope), "*.toml"))):
+    for scope in ("user", "project", "policy"):
+        paths = policy_pack_paths() if scope == "policy" else \
+            sorted(glob.glob(os.path.join(scope_dir(workspace, scope), "*.toml")))
+        for path in paths:
             with contextlib.suppress(OSError):
-                parts.append(f"{path}:{os.path.getmtime(path)}:{os.path.getsize(path)}")
+                parts.append(f"{scope}:{path}:{os.path.getmtime(path)}:{os.path.getsize(path)}")
     return "|".join(parts)
 
 

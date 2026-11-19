@@ -285,7 +285,9 @@ _CLIENTS: dict = {}
 
 def get_client():
     if CHROMA_DIR not in _CLIENTS:
-        _CLIENTS[CHROMA_DIR] = chromadb.PersistentClient(path=CHROMA_DIR)
+        from chromadb.config import Settings
+        # No usage telemetry: nothing about the user's guidelines or usage leaves the machine.
+        _CLIENTS[CHROMA_DIR] = chromadb.PersistentClient(path=CHROMA_DIR, settings=Settings(anonymized_telemetry=False))
     return _CLIENTS[CHROMA_DIR]
 
 
