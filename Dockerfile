@@ -11,13 +11,13 @@
 # The server binds all interfaces inside the container, so it refuses to start without
 # authentication (API tokens, NOVUS_AUTH_TOKEN or OIDC).
 
-FROM python:3.13-slim AS build
+FROM python:3.15-slim AS build
 WORKDIR /src
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 RUN pip install --no-cache-dir build && python -m build --wheel --outdir /dist
 
-FROM python:3.13-slim
+FROM python:3.15-slim
 ARG EXTRAS=""
 LABEL org.opencontainers.image.title="NovusPipeline" \
       org.opencontainers.image.description="Codebase-aware legacy code modernization MCP server, test-gated" \
